@@ -507,3 +507,222 @@ test('wait: falha no agentapi (FAKE_EXIT=1) sai 5 e grava wake_failed no history
   assert.equal(lastHistory.action, 'wake_failed');
 });
 
+// --- Task 3: Codex por empurrar tests ---
+
+function setupFakeCodex() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-codex-'));
+  const scriptPath = path.join(tmpDir, 'fake-codex.mjs');
+  const logPath = path.join(tmpDir, 'fake-codex-log.json');
+  fs.writeFileSync(scriptPath, `import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+
+let stdin = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => stdin += chunk);
+process.stdin.on('end', () => {
+  const log = process.env.FAKE_LOG;
+  if (log) {
+    fs.writeFileSync(log, JSON.stringify({ argv: process.argv.slice(2), stdin }), 'utf8');
+  }
+  process.stdout.write('session id: t-123\\n');
+  process.stdout.write('codex\\nok ação\\n');
+
+  if (process.env.FAKE_PASS === '1') {
+    const cIndex = process.argv.indexOf('-C');
+    const repo = cIndex !== -1 ? process.argv[cIndex + 1] : process.cwd();
+    spawnSync(process.execPath, [
+      process.env.BASTAO_CLI_PATH,
+      'pass',
+      '--repo=' + repo,
+      '--from=codex',
+      '--to=claude',
+      '--action=review'
+    ], { stdio: 'inherit' });
+  }
+
+  process.exit(Number(process.env.FAKE_EXIT ?? 0));
+});
+`, 'utf8');
+  return { scriptPath, logPath };
+}
+
+test('codex: executa via pass sem thread, captura session id, grava live log', async () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeCodex();
+
+  runCli([
+    'init',
+    '--task=Testar codex sem thread',
+    '--slug=teste-codex',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  const notesComAcento = 'Ação com acentuação e aspas "ok"';
+  runCli([
+    'pass',
+    '--from=claude',
+    '--to=codex',
+    '--action=implement',
+    `--notes=${notesComAcento}`,
+    `--repo=${repo}`
+  ], repo, {
+    BASTAO_CODEX: scriptPath,
+    BASTAO_CLI_PATH: BASTAO_CLI,
+    FAKE_LOG: logPath
+  });
+
+  // Aguarda até 5s para o processo desanexado do codex rodar
+  const start = Date.now();
+  let state = null;
+  while (Date.now() - start < 5000) {
+    await new Promise(r => setTimeout(r, 100));
+    try {
+      state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+      if (state.conversations?.codex === 't-123') break;
+    } catch {}
+  }
+
+  assert.equal(state.conversations?.codex, 't-123', 'Deve capturar session id t-123');
+
+  assert.ok(fs.existsSync(logPath), 'Log do fake codex deve existir');
+  const fakeData = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+  assert.ok(fakeData.argv.includes('exec'));
+  assert.ok(fakeData.argv.includes('--sandbox'));
+  assert.ok(fakeData.argv.includes('workspace-write'));
+  assert.ok(fakeData.argv.includes('-C'));
+  assert.ok(fakeData.argv.includes('-'));
+  assert.ok(fakeData.stdin.includes('Vez de: codex'));
+  assert.ok(fakeData.stdin.includes(notesComAcento));
+
+  // Como FAKE_PASS não foi 1, deve ter ido para WAITING_HUMAN após terminar
+  assert.equal(state.status, 'WAITING_HUMAN');
+  assert.equal(state.ask_human?.from, 'codex');
+
+  const liveLog = path.join(repo, '.agents', 'live', 'codex.log');
+  assert.ok(fs.existsSync(liveLog), 'Arquivo live/codex.log deve existir');
+  const logContent = fs.readFileSync(liveLog, 'utf8');
+  assert.ok(logContent.includes('ok ação'));
+});
+
+test('codex: com thread informada resume a thread', async () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeCodex();
+
+  runCli([
+    'init',
+    '--task=Testar codex com thread',
+    '--slug=teste-codex-thread',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    '--codex-thread=abc-thread',
+    `--repo=${repo}`
+  ], repo);
+
+  runCli([
+    'pass',
+    '--from=claude',
+    '--to=codex',
+    '--action=implement',
+    `--repo=${repo}`
+  ], repo, {
+    BASTAO_CODEX: scriptPath,
+    BASTAO_CLI_PATH: BASTAO_CLI,
+    FAKE_LOG: logPath
+  });
+
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    await new Promise(r => setTimeout(r, 100));
+    if (fs.existsSync(logPath)) break;
+  }
+
+  assert.ok(fs.existsSync(logPath));
+  const fakeData = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+  const resumeIdx = fakeData.argv.indexOf('resume');
+  assert.ok(resumeIdx !== -1);
+  assert.equal(fakeData.argv[resumeIdx + 1], 'abc-thread');
+});
+
+test('codex: FAKE_PASS=1 passa o bastao para claude', async () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeCodex();
+
+  runCli([
+    'init',
+    '--task=Testar codex pass',
+    '--slug=teste-codex-pass',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  runCli([
+    'pass',
+    '--from=claude',
+    '--to=codex',
+    '--action=implement',
+    `--repo=${repo}`
+  ], repo, {
+    BASTAO_CODEX: scriptPath,
+    BASTAO_CLI_PATH: BASTAO_CLI,
+    FAKE_LOG: logPath,
+    FAKE_PASS: '1'
+  });
+
+  const start = Date.now();
+  let state = null;
+  while (Date.now() - start < 5000) {
+    await new Promise(r => setTimeout(r, 100));
+    try {
+      state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+      if (state.current_turn === 'claude' && state.status === 'IN_PROGRESS') break;
+    } catch {}
+  }
+
+  assert.equal(state.current_turn, 'claude');
+  assert.equal(state.status, 'IN_PROGRESS');
+});
+
+test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeCodex();
+
+  runCli([
+    'init',
+    '--task=Testar codex exit 1',
+    '--slug=teste-codex-exit',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  runCli([
+    'pass',
+    '--from=claude',
+    '--to=codex',
+    '--action=implement',
+    `--repo=${repo}`
+  ], repo, {
+    BASTAO_CODEX: scriptPath,
+    BASTAO_CLI_PATH: BASTAO_CLI,
+    FAKE_LOG: logPath,
+    FAKE_EXIT: '1'
+  });
+
+  const start = Date.now();
+  let state = null;
+  while (Date.now() - start < 5000) {
+    await new Promise(r => setTimeout(r, 100));
+    try {
+      state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+      if (state.status === 'WAITING_HUMAN') break;
+    } catch {}
+  }
+
+  assert.equal(state.status, 'WAITING_HUMAN');
+  assert.match(state.ask_human?.question, /exit 1/);
+});
+
+

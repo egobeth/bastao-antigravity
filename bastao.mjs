@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
 export class BastaoError extends Error {
   constructor(message, code = 'GENERIC') {
@@ -323,6 +323,36 @@ export function isLockAlive(lockPath) {
   }
 }
 
+export function findCodex() {
+  if (process.env.BASTAO_CODEX) {
+    return process.env.BASTAO_CODEX;
+  }
+
+  const whereRes = spawnSync('where', ['codex'], { encoding: 'utf8' });
+  if (whereRes.status === 0 && whereRes.stdout) {
+    const firstPath = whereRes.stdout.trim().split(/\r?\n/)[0].trim();
+    if (firstPath) return firstPath;
+  }
+
+  const userProfile = process.env.USERPROFILE || '';
+  const extensionsDir = path.join(userProfile, '.antigravity-ide', 'extensions');
+  if (fs.existsSync(extensionsDir)) {
+    try {
+      const dirs = fs.readdirSync(extensionsDir)
+        .filter(name => name.startsWith('openai.chatgpt-'))
+        .sort((a, b) => b.localeCompare(a));
+      for (const d of dirs) {
+        const candidate = path.join(extensionsDir, d, 'bin', 'windows-x86_64', 'codex.exe');
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+      }
+    } catch {}
+  }
+
+  throw new BastaoError('Codex não encontrado', 'CODEX_NOT_FOUND');
+}
+
 export function notify(text) {
   if (process.env.BASTAO_NOTIFY === 'off') return;
   const username = process.env.USERNAME || process.env.USER || '';
@@ -444,6 +474,17 @@ export async function main() {
     writeState(repo, nextState);
     if (notifyMsg) notify(notifyMsg);
     console.log(`bastao: bastão passado para ${nextState.current_turn} (${nextState.action})`);
+
+    if (nextState.current_turn === 'codex' && nextState.status === 'IN_PROGRESS') {
+      const bastaoScript = fileURLToPath(import.meta.url);
+      const child = spawn(process.execPath, [bastaoScript, '_codex', `--repo=${repo}`], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        env: process.env
+      });
+      child.unref();
+    }
     return;
   }
 
@@ -617,10 +658,85 @@ export async function main() {
     }
   }
 
+  if (command === '_codex') {
+    const state = await readState(repo);
+    if (!state || state.current_turn !== 'codex' || state.status !== 'IN_PROGRESS') {
+      return;
+    }
+
+    const codexBin = findCodex();
+
+    let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', repo];
+    if (state.conversations?.codex) {
+      codexArgs.push('resume', state.conversations.codex);
+    }
+    codexArgs.push('-');
+
+    const prompt = `${formatInstructions(state)}\n\nVocê é o Codex no Protocolo do Bastão. Siga a skill bastao. Termine SEMPRE com: bastao pass --from=codex …`;
+
+    const liveDir = path.join(repo, '.agents', 'live');
+    fs.mkdirSync(liveDir, { recursive: true });
+    const logPath = path.join(liveDir, 'codex.log');
+
+    const nowTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    const separator = `\n=== Round ${state.round}/${state.max_rounds} · ${state.action} · ${nowTime} ===\n`;
+    fs.appendFileSync(logPath, separator, 'utf8');
+
+    const isNodeScript = codexBin.endsWith('.mjs');
+    const execCmd = isNodeScript ? process.execPath : codexBin;
+    const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
+
+    const child = spawn(execCmd, finalArgs, {
+      cwd: repo,
+      windowsHide: true,
+      env: process.env
+    });
+
+    child.stdin.write(prompt, 'utf8');
+    child.stdin.end();
+
+    let fullOutput = '';
+    child.stdout.on('data', chunk => {
+      fullOutput += chunk.toString('utf8');
+      fs.appendFileSync(logPath, chunk);
+    });
+    child.stderr.on('data', chunk => {
+      fullOutput += chunk.toString('utf8');
+      fs.appendFileSync(logPath, chunk);
+    });
+
+    const exitCode = await new Promise(resolve => child.on('close', resolve));
+
+    if (!state.conversations?.codex) {
+      const m = fullOutput.match(/session id:\s*([a-zA-Z0-9_-]+)/i);
+      if (m) {
+        const sessId = m[1];
+        const cur = await readState(repo);
+        if (cur) {
+          cur.conversations = cur.conversations || {};
+          cur.conversations.codex = sessId;
+          writeState(repo, cur);
+        }
+      }
+    }
+
+    const latest = await readState(repo);
+    if (latest && latest.current_turn === 'codex' && latest.status === 'IN_PROGRESS') {
+      const question = `Codex terminou sem passar o bastão (exit ${exitCode ?? 0}). Veja .agents/live/codex.log`;
+      const { state: nextState, notify: notifyMsg } = applyAsk(latest, {
+        from: 'codex',
+        question
+      });
+      writeState(repo, nextState);
+      if (notifyMsg) notify(notifyMsg);
+    }
+    return;
+  }
+
   throw new BastaoError(`Comando desconhecido: ${command}`, 'UNKNOWN_COMMAND');
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     await main();
   } catch (err) {

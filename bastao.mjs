@@ -376,6 +376,105 @@ export async function main() {
     return;
   }
 
+  if (command === 'install') {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        yes: { type: 'boolean', default: false },
+        home: { type: 'string' }
+      },
+      allowPositionals: true,
+      strict: false
+    });
+
+    const home = values.home || process.env.USERPROFILE || process.env.HOME || '';
+    const isDryRun = !values.yes;
+
+    console.log(`bastao install: ${isDryRun ? '[SIMULAÇÃO - use --yes para aplicar]' : '[EXECUTANDO]'}`);
+
+    const agentApiBat = path.join(process.env.USERPROFILE || '', '.gemini', 'antigravity-ide', 'bin', 'agentapi.bat');
+    const agentApiOk = fs.existsSync(agentApiBat);
+    console.log(`  agentapi.bat: ${agentApiOk ? '✓' : '✗'} (${agentApiBat})`);
+
+    let codexPath = null;
+    try {
+      codexPath = findCodex();
+      console.log(`  findCodex: ✓ (${codexPath})`);
+    } catch {
+      console.log('  findCodex: ✗ (não encontrado)');
+    }
+
+    const currentFile = fileURLToPath(import.meta.url);
+    const skillSource = path.join(path.dirname(currentFile), 'SKILL.md');
+    const destinations = [
+      path.join(home, '.claude', 'skills', 'bastao', 'SKILL.md'),
+      path.join(home, '.gemini', 'antigravity', 'skills', 'bastao', 'SKILL.md'),
+      path.join(home, '.codex', 'skills', 'bastao', 'SKILL.md')
+    ];
+
+    for (const dst of destinations) {
+      if (isDryRun) {
+        console.log(`  [dry-run] Copiaria SKILL.md para ${dst}`);
+      } else {
+        if (fs.existsSync(skillSource)) {
+          fs.mkdirSync(path.dirname(dst), { recursive: true });
+          fs.copyFileSync(skillSource, dst);
+          console.log(`  ✓ Instalada skill em ${dst}`);
+        } else {
+          console.warn(`  ✗ Arquivo fonte da skill não encontrado: ${skillSource}`);
+        }
+      }
+    }
+
+    const claudeSettingsFile = path.join(home, '.claude', 'settings.json');
+    if (isDryRun) {
+      console.log(`  [dry-run] Adicionaria Bash(bastao:*) e PowerShell(bastao:*) em ${claudeSettingsFile}`);
+    } else {
+      let settings = {};
+      if (fs.existsSync(claudeSettingsFile)) {
+        try {
+          settings = JSON.parse(fs.readFileSync(claudeSettingsFile, 'utf8'));
+        } catch {
+          settings = {};
+        }
+      }
+      settings.permissions = settings.permissions || {};
+      settings.permissions.allow = settings.permissions.allow || [];
+      const rules = ['Bash(bastao:*)', 'PowerShell(bastao:*)'];
+      for (const rule of rules) {
+        if (!settings.permissions.allow.includes(rule)) {
+          settings.permissions.allow.push(rule);
+        }
+      }
+      fs.mkdirSync(path.dirname(claudeSettingsFile), { recursive: true });
+      fs.writeFileSync(claudeSettingsFile, JSON.stringify(settings, null, 2) + '\n', 'utf8');
+      console.log(`  ✓ Permissões configuradas em ${claudeSettingsFile}`);
+    }
+
+    if (!isDryRun && !values.home) {
+      const toolDir = path.dirname(currentFile);
+      try {
+        const psCmd = `
+          $cur = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $target = '${toolDir.replace(/'/g, "''")}'
+          if ($cur -notlike "*$target*") {
+            $new = if ($cur) { "$cur;$target" } else { $target }
+            [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+          }
+        `;
+        spawnSync('powershell', ['-NoProfile', '-Command', psCmd], { windowsHide: true });
+        console.log(`  ✓ Adicionado ao PATH do usuário: ${toolDir}`);
+      } catch (err) {
+        console.warn(`  ✗ Não foi possível atualizar o PATH automaticamente: ${err.message}`);
+      }
+    } else if (isDryRun && !values.home) {
+      const toolDir = path.dirname(currentFile);
+      console.log(`  [dry-run] Adicionaria ao PATH do usuário: ${toolDir}`);
+    }
+
+    return;
+  }
+
   const repoArgIndex = rest.findIndex(a => a.startsWith('--repo=') || a === '--repo');
   let repoPath = null;
   if (repoArgIndex !== -1) {

@@ -725,4 +725,67 @@ test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
   assert.match(state.ask_human?.question, /exit 1/);
 });
 
+// --- Task 4: install tests ---
+
+test('install: sem --yes apenas exibe acoes sem alterar nada', () => {
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-home-'));
+  const res = runCli(['install', `--home=${fakeHome}`], fakeHome);
+  assert.equal(res.status, 0);
+
+  const claudeSkill = path.join(fakeHome, '.claude', 'skills', 'bastao', 'SKILL.md');
+  const geminiSkill = path.join(fakeHome, '.gemini', 'antigravity', 'skills', 'bastao', 'SKILL.md');
+  const codexSkill = path.join(fakeHome, '.codex', 'skills', 'bastao', 'SKILL.md');
+  const settingsFile = path.join(fakeHome, '.claude', 'settings.json');
+
+  assert.ok(!fs.existsSync(claudeSkill));
+  assert.ok(!fs.existsSync(geminiSkill));
+  assert.ok(!fs.existsSync(codexSkill));
+  assert.ok(!fs.existsSync(settingsFile));
+});
+
+test('install: com --yes instala skill nos 3 destinos e atualiza settings.json preservando conteudo sem BOM', () => {
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-home-'));
+  const claudeDir = path.join(fakeHome, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const settingsFile = path.join(claudeDir, 'settings.json');
+  fs.writeFileSync(settingsFile, JSON.stringify({
+    theme: 'dark',
+    permissions: {
+      allow: ['Bash(git:*)']
+    }
+  }, null, 2), 'utf8');
+
+  // 1ª execução com --yes
+  let res = runCli(['install', '--yes', `--home=${fakeHome}`], fakeHome);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+
+  const claudeSkill = path.join(fakeHome, '.claude', 'skills', 'bastao', 'SKILL.md');
+  const geminiSkill = path.join(fakeHome, '.gemini', 'antigravity', 'skills', 'bastao', 'SKILL.md');
+  const codexSkill = path.join(fakeHome, '.codex', 'skills', 'bastao', 'SKILL.md');
+
+  assert.ok(fs.existsSync(claudeSkill), 'Skill deve existir no Claude');
+  assert.ok(fs.existsSync(geminiSkill), 'Skill deve existir no Gemini');
+  assert.ok(fs.existsSync(codexSkill), 'Skill deve existir no Codex');
+
+  let rawSettings = fs.readFileSync(settingsFile);
+  assert.equal(rawSettings[0], 0x7B, 'settings.json não deve ter BOM');
+  let settings = JSON.parse(rawSettings.toString('utf8'));
+  assert.equal(settings.theme, 'dark');
+  assert.ok(settings.permissions.allow.includes('Bash(git:*)'));
+  assert.ok(settings.permissions.allow.includes('Bash(bastao:*)'));
+  assert.ok(settings.permissions.allow.includes('PowerShell(bastao:*)'));
+
+  // 2ª execução com --yes não deve duplicar
+  res = runCli(['install', '--yes', `--home=${fakeHome}`], fakeHome);
+  assert.equal(res.status, 0);
+
+  rawSettings = fs.readFileSync(settingsFile);
+  settings = JSON.parse(rawSettings.toString('utf8'));
+  const bashCount = settings.permissions.allow.filter(x => x === 'Bash(bastao:*)').length;
+  const psCount = settings.permissions.allow.filter(x => x === 'PowerShell(bastao:*)').length;
+  assert.equal(bashCount, 1, 'Não deve duplicar regra Bash');
+  assert.equal(psCount, 1, 'Não deve duplicar regra PowerShell');
+});
+
+
 

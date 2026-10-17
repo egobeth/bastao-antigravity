@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -301,3 +301,209 @@ test('turn.json inválido falha com código 1, mensagem clara e sem stack trace'
   assert.doesNotMatch(res.stderr, /^\s+at\s+/m, 'stderr não deve conter stack trace');
   assert.equal(fs.readFileSync(turnPath, 'utf8'), '{quebrado', 'arquivo não deve ser alterado');
 });
+
+// --- Task 2: wait, lock e wake tests ---
+
+function setupFakeAgentApi() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-agentapi-'));
+  const scriptPath = path.join(tmpDir, 'fake-agentapi.mjs');
+  const logPath = path.join(tmpDir, 'fake.log');
+  fs.writeFileSync(scriptPath, `import fs from 'node:fs';
+const log = process.env.FAKE_LOG;
+if (log) {
+  fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + '\\n', 'utf8');
+}
+process.exit(Number(process.env.FAKE_EXIT ?? 0));
+`, 'utf8');
+  return { scriptPath, logPath };
+}
+
+test('wait: ja e a vez de gemini sai 0 em menos de 1 s', () => {
+  const repo = tempRepo();
+  runCli([
+    'init',
+    '--task=Testar wait',
+    '--slug=teste-wait',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  // claude passa para gemini
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+
+  const start = Date.now();
+  const res = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  const elapsed = Date.now() - start;
+
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(elapsed < 1500, `Demorou ${elapsed}ms, esperado < 1500ms`);
+  assert.match(res.stdout, /Vez de:\s*gemini/i);
+});
+
+test('wait: vez do claude, pass para gemini acorda via wake sem caracteres proibidos', async () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeAgentApi();
+
+  runCli([
+    'init',
+    '--task=Testar wait wake',
+    '--slug=teste-wake',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  const geminiId = 'conv-123-gemini';
+  const waitProc = spawn(process.execPath, [
+    BASTAO_CLI,
+    'wait',
+    '--for=gemini',
+    `--wake=${geminiId}`,
+    `--repo=${repo}`
+  ], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      BASTAO_NOTIFY: 'off',
+      BASTAO_POLL_MS: '50',
+      BASTAO_AGENTAPI: scriptPath,
+      FAKE_LOG: logPath
+    }
+  });
+
+  await new Promise(r => setTimeout(r, 200));
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+
+  const code = await new Promise(resolve => waitProc.on('close', resolve));
+
+  assert.equal(code, 0);
+  assert.ok(fs.existsSync(logPath), 'Log do fake agentapi deve existir');
+  const logContent = fs.readFileSync(logPath, 'utf8');
+  assert.ok(logContent.includes('send-message'));
+  assert.ok(logContent.includes(geminiId));
+  const parsed = JSON.parse(logContent.trim());
+  const wakeText = parsed[3];
+  // Proibidos: & | < > ^ " %
+  assert.doesNotMatch(wakeText, /[&|<>^"%]/);
+});
+
+test('wait: status terminal APPROVED sai 3', () => {
+  const repo = tempRepo();
+  runCli([
+    'init',
+    '--task=Testar status terminal',
+    '--slug=teste-term',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  // Leva a APPROVED
+  runCli(['pass', '--from=claude', '--to=human', '--action=done', `--repo=${repo}`], repo);
+
+  const res = runCli(['wait', '--for=claude', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  assert.equal(res.status, 3);
+});
+
+test('wait: timeout-min rapido sai 2 e envia aviso de timeout', () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeAgentApi();
+
+  runCli([
+    'init',
+    '--task=Testar timeout',
+    '--slug=teste-timeout',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  // Vez do claude, esperamos por gemini com timeout de ~0.02 min (1.2 s)
+  const res = runCli([
+    'wait',
+    '--for=gemini',
+    '--timeout-min=0.02',
+    '--wake=conv-timeout',
+    `--repo=${repo}`
+  ], repo, {
+    BASTAO_POLL_MS: '50',
+    BASTAO_AGENTAPI: scriptPath,
+    FAKE_LOG: logPath
+  });
+
+  assert.equal(res.status, 2);
+  assert.match(res.stdout, /TIMEOUT:\s*rearme o wait/i);
+  assert.ok(fs.existsSync(logPath));
+  const logContent = fs.readFileSync(logPath, 'utf8');
+  assert.match(logContent, /tempo esgotado/i);
+});
+
+test('wait: lock concorrente sai 4, lock orfao ou antigo e assumido', () => {
+  const repo = tempRepo();
+  runCli([
+    'init',
+    '--task=Testar lock',
+    '--slug=teste-lock',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  const lockPath = path.join(repo, '.agents', 'wait-gemini.lock');
+
+  // 1. Simula lock ativo com PID atual e mtime recente
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+
+  const res = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  assert.equal(res.status, 4, `Esperado 4 para lock ativo, obteve ${res.status}`);
+
+  // 2. Lock com PID inexistente (999999) deve ser assumido
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, started_at: new Date().toISOString() }), 'utf8');
+  // Passa para gemini para sair 0
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  const res2 = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  assert.equal(res2.status, 0);
+
+  // 3. Lock com PID vivo mas heartbeat antigo (> 30s) deve ser assumido
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+  const pastTime = new Date(Date.now() - 60000);
+  fs.utimesSync(lockPath, pastTime, pastTime);
+  const res3 = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  assert.equal(res3.status, 0);
+});
+
+test('wait: falha no agentapi (FAKE_EXIT=1) sai 5 e grava wake_failed no history', () => {
+  const repo = tempRepo();
+  const { scriptPath } = setupFakeAgentApi();
+
+  runCli([
+    'init',
+    '--task=Testar falha wake',
+    '--slug=teste-wake-fail',
+    '--spec=docs/spec.md',
+    '--plan=docs/plan.md',
+    `--repo=${repo}`
+  ], repo);
+
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+
+  const res = runCli([
+    'wait',
+    '--for=gemini',
+    '--wake=conv-fail',
+    `--repo=${repo}`
+  ], repo, {
+    BASTAO_POLL_MS: '50',
+    BASTAO_AGENTAPI: scriptPath,
+    FAKE_EXIT: '1'
+  });
+
+  assert.equal(res.status, 5);
+
+  const turnPath = path.join(repo, '.agents', 'turn.json');
+  const state = JSON.parse(fs.readFileSync(turnPath, 'utf8'));
+  const lastHistory = state.history[state.history.length - 1];
+  assert.equal(lastHistory.action, 'wake_failed');
+});
+

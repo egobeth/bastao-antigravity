@@ -277,6 +277,52 @@ export function ensureExclude(repo) {
   }
 }
 
+export function sendAgentApiMessage(wakeId, text) {
+  const custom = process.env.BASTAO_AGENTAPI;
+  if (custom) {
+    if (custom.endsWith('.mjs')) {
+      const res = spawnSync(process.execPath, [custom, 'send-message', '--title=Bastao', wakeId, text], {
+        encoding: 'utf8'
+      });
+      return res.status === 0;
+    }
+    const res = spawnSync(custom, ['send-message', '--title=Bastao', wakeId, text], {
+      encoding: 'utf8',
+      shell: true
+    });
+    return res.status === 0;
+  }
+  const userProfile = process.env.USERPROFILE || '';
+  const batPath = path.join(userProfile, '.gemini', 'antigravity-ide', 'bin', 'agentapi.bat');
+  const res = spawnSync('cmd.exe', ['/d', '/s', '/c', `"${batPath}" send-message --title=Bastao ${wakeId} "${text}"`], {
+    encoding: 'utf8',
+    windowsHide: true
+  });
+  return res.status === 0;
+}
+
+export function isLockAlive(lockPath) {
+  if (!fs.existsSync(lockPath)) return false;
+  try {
+    const stat = fs.statSync(lockPath);
+    if (Date.now() - stat.mtimeMs > 30000) {
+      return false;
+    }
+    const raw = fs.readFileSync(lockPath, 'utf8');
+    const data = JSON.parse(raw);
+    const pid = Number(data.pid);
+    if (!pid) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return err.code === 'EPERM';
+    }
+  } catch {
+    return false;
+  }
+}
+
 export function notify(text) {
   if (process.env.BASTAO_NOTIFY === 'off') return;
   const username = process.env.USERNAME || process.env.USER || '';
@@ -459,6 +505,116 @@ export async function main() {
       }
     }
     return;
+  }
+
+  if (command === 'wait') {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        for: { type: 'string' },
+        wake: { type: 'string' },
+        'timeout-min': { type: 'string', default: '240' },
+        repo: { type: 'string' }
+      },
+      allowPositionals: true,
+      strict: false
+    });
+
+    if (!values.for) {
+      throw new BastaoError('Comando wait exige --for=<agente>', 'INVALID_ARGS');
+    }
+
+    const forAgent = values.for;
+    const lockPath = path.join(repo, '.agents', `wait-${forAgent}.lock`);
+
+    if (isLockAlive(lockPath)) {
+      console.error(`bastao: já existe vigia ativo para ${forAgent}`);
+      process.exit(4);
+    }
+
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+
+    const cleanLock = () => {
+      try {
+        if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+      } catch {}
+    };
+
+    process.on('exit', cleanLock);
+
+    try {
+      const wakeId = values.wake;
+      if (wakeId) {
+        const state = await readState(repo);
+        if (state) {
+          state.conversations = state.conversations || {};
+          if (state.conversations.gemini !== wakeId) {
+            state.conversations.gemini = wakeId;
+            writeState(repo, state);
+          }
+        }
+      }
+
+      const pollMs = Number(process.env.BASTAO_POLL_MS) || 2000;
+      const timeoutMin = Number(values['timeout-min']) || 240;
+      const timeoutMs = timeoutMin * 60 * 1000;
+      const startTime = Date.now();
+
+      while (true) {
+        try {
+          fs.utimesSync(lockPath, new Date(), new Date());
+        } catch {}
+
+        const state = await readState(repo);
+
+        if (state && ['APPROVED', 'MAX_ROUNDS_REACHED', 'MANUAL_PAUSE'].includes(state.status)) {
+          if (wakeId) {
+            sendAgentApiMessage(wakeId, 'Bastao: ciclo finalizado ou pausado. Rode: bastao status  e siga a skill bastao.');
+          }
+          console.log(`Estado terminal: ${state.status}`);
+          cleanLock();
+          process.exit(3);
+        }
+
+        if (state && state.current_turn === forAgent && state.status === 'IN_PROGRESS') {
+          if (wakeId) {
+            const ok = sendAgentApiMessage(wakeId, 'Bastao: sua vez. Rode: bastao status  e siga a skill bastao.');
+            if (!ok) {
+              state.history = state.history || [];
+              state.history.push({
+                at: new Date().toISOString(),
+                from: 'wait',
+                to: forAgent,
+                action: 'wake_failed',
+                round: state.round,
+                notes: `Falha ao acordar ${forAgent}`,
+                evidence: null
+              });
+              writeState(repo, state);
+              notify(`[FALHA] Falha ao acordar ${forAgent}`);
+              cleanLock();
+              process.exit(5);
+            }
+          }
+          console.log(formatInstructions(state));
+          cleanLock();
+          process.exit(0);
+        }
+
+        if (Date.now() - startTime >= timeoutMs) {
+          if (wakeId) {
+            sendAgentApiMessage(wakeId, 'Bastao: tempo esgotado. Rode o wait de novo conforme a skill bastao.');
+          }
+          console.log('TIMEOUT: rearme o wait');
+          cleanLock();
+          process.exit(2);
+        }
+
+        await sleep(pollMs);
+      }
+    } finally {
+      cleanLock();
+    }
   }
 
   throw new BastaoError(`Comando desconhecido: ${command}`, 'UNKNOWN_COMMAND');

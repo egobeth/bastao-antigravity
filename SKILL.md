@@ -25,12 +25,29 @@ Protocolo de passagem de turno e handoff conversacional contínuo entre Claude C
 ### Gemini (Antigravity)
 - Obtenha o seu Conversation ID nos metadados da sessão.
 - Ao esperar sua vez: execute `bastao wait --for=gemini --wake=<id>` em segundo plano e encerre seu turno. O vigia acordará esta conversa quando chegar sua vez.
-- Nunca use vigia sem passar o seu ID atualizado.
+- Nunca use vigia sem passar o seu ID atualizado. Numa conversa nova ("retome o bastão"), o `wait` com o novo ID substitui o antigo.
 
 ### Codex
 - **Nunca arma vigia.** O Codex é acionado diretamente pelo comando `bastao pass --to=codex` e encerra sua execução assim que passar o bastão.
+- A saída do Codex fica em `.agents/live/codex.log`, com um separador `=== Round r/m · <ação> · HH:MM ===` por turno.
+- Se o Codex terminar sem passar o bastão, o ciclo vai para `WAITING_HUMAN` com a pergunta automática. Para responder, qualquer IA no chat roda, a pedido do usuário:
+  `bastao pass --from=human --to=codex --action=<ação> --force --notes="<resposta do usuário>"`
+
+### Saídas do `wait`
+| Código | O que fazer |
+|---|---|
+| 0 | é sua vez: siga as instruções impressas |
+| 2 | tempo esgotado: arme o `wait` de novo |
+| 3 | ciclo `APPROVED`, `MAX_ROUNDS_REACHED` ou `MANUAL_PAUSE`: rode `bastao status` e avise o usuário; não rearme |
+| 4 | já existe vigia vivo para você: não arme outro |
+| 5 | falha ao acordar o Gemini: avise o usuário |
 
 ## 3. Fluxo de Trabalho
+
+### Iniciar um ciclo (Claude, depois que o usuário aprovar spec e plano)
+`bastao init --task="<tarefa>" --slug=<slug> --spec=<caminho> --plan=<caminho> [--implement=gemini] [--review=claude,codex] [--max-rounds=3] [--codex-thread=<id>]`
+
+Depois, `bastao pass --from=claude --to=<implementador> --action=implement --notes="<resumo>"`. Papéis e skills mudam a qualquer momento com `--roles=implement:codex,review:claude+gemini` e `--skills=a,b` no `pass`. O usuário assume o controle com `bastao pause` e devolve com `bastao pass --from=human --to=<agente> --action=<ação>`.
 
 ### Ao entrar ou retomar
 1. Execute `bastao status` para ler o estado atual do ciclo.

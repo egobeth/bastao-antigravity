@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -10,6 +10,8 @@ import { parseRoles } from './bastao.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BASTAO_CLI = path.join(__dirname, 'bastao.mjs');
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'bastao-teste-'));
+after(() => fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5 }));
 
 process.env.BASTAO_NOTIFY = 'off';
 
@@ -22,7 +24,7 @@ function runCli(args, cwd, env = {}) {
 }
 
 function tempRepo() {
-  const base = path.join(os.tmpdir(), `bastao-teste-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const base = path.join(ROOT, `bastao-teste-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const repoDir = path.join(base, 'pasta com espaço é');
   fs.mkdirSync(repoDir, { recursive: true });
   spawnSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
@@ -305,7 +307,7 @@ test('turn.json inválido falha com código 1, mensagem clara e sem stack trace'
 // --- Task 2: wait, lock e wake tests ---
 
 function setupFakeAgentApi() {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-agentapi-'));
+  const tmpDir = fs.mkdtempSync(path.join(ROOT, 'fake-agentapi-'));
   const scriptPath = path.join(tmpDir, 'fake-agentapi.mjs');
   const logPath = path.join(tmpDir, 'fake.log');
   fs.writeFileSync(scriptPath, `import fs from 'node:fs';
@@ -510,7 +512,7 @@ test('wait: falha no agentapi (FAKE_EXIT=1) sai 5 e grava wake_failed no history
 // --- Task 3: Codex por empurrar tests ---
 
 function setupFakeCodex() {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-codex-'));
+  const tmpDir = fs.mkdtempSync(path.join(ROOT, 'fake-codex-'));
   const scriptPath = path.join(tmpDir, 'fake-codex.mjs');
   const logPath = path.join(tmpDir, 'fake-codex-log.json');
   fs.writeFileSync(scriptPath, `import fs from 'node:fs';
@@ -728,7 +730,7 @@ test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
 // --- Task 4: install tests ---
 
 test('install: sem --yes apenas exibe acoes sem alterar nada', () => {
-  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-home-'));
+  const fakeHome = fs.mkdtempSync(path.join(ROOT, 'fake-home-'));
   const res = runCli(['install', `--home=${fakeHome}`], fakeHome);
   assert.equal(res.status, 0);
 
@@ -744,7 +746,7 @@ test('install: sem --yes apenas exibe acoes sem alterar nada', () => {
 });
 
 test('install: com --yes instala skill nos 3 destinos e atualiza settings.json preservando conteudo sem BOM', () => {
-  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-home-'));
+  const fakeHome = fs.mkdtempSync(path.join(ROOT, 'fake-home-'));
   const claudeDir = path.join(fakeHome, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
   const settingsFile = path.join(claudeDir, 'settings.json');
@@ -787,5 +789,71 @@ test('install: com --yes instala skill nos 3 destinos e atualiza settings.json p
   assert.equal(psCount, 1, 'Não deve duplicar regra PowerShell');
 });
 
+// --- Revisão: caminhos reais que os fakes .mjs não cobriam ---
+
+test('wait: agentapi .bat em pasta com espaço recebe id e texto como argumentos', () => {
+  const repo = tempRepo();
+  const binDir = path.join(ROOT, `bin com espaço ${Date.now()}`);
+  fs.mkdirSync(binDir);
+  const logPath = path.join(binDir, 'args.log');
+  const bat = path.join(binDir, 'agentapi.bat');
+  fs.writeFileSync(bat, '@echo off\r\n>"%~dp0args.log" echo %*\r\n', 'utf8');
+
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  const res = runCli(['wait', '--for=gemini', '--wake=conv-1', `--repo=${repo}`], repo, { BASTAO_AGENTAPI: bat });
+
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.equal(fs.readFileSync(logPath, 'utf8').trim(),
+    'send-message --title=Bastao conv-1 "Bastao: sua vez. Rode: bastao status  e siga a skill bastao."');
+});
+
+test('pass e wait recusam agente inválido, flag com typo, wake inválido e repo sem ciclo', () => {
+  const repo = tempRepo();
+  assert.equal(runCli(['wait', '--for=gemini', `--repo=${repo}`], repo).status, 1, 'sem ciclo não fica pendurado');
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const turnPath = path.join(repo, '.agents', 'turn.json');
+  const before = fs.readFileSync(turnPath);
+  assert.equal(runCli(['pass', '--from=claude', '--to=gemni', '--action=implement', `--repo=${repo}`], repo).status, 1);
+  const typo = runCli(['pass', '--from=claude', '--to=gemini', '--acton=implement', `--repo=${repo}`], repo);
+  assert.equal(typo.status, 1);
+  assert.doesNotMatch(typo.stderr, /^\s+at\s+/m, 'sem stack trace');
+  assert.equal(runCli(['wait', '--for=gemini', '--wake=a&b', `--repo=${repo}`], repo).status, 1);
+  assert.deepEqual(fs.readFileSync(turnPath), before);
+});
+
+test('codex: binário inexistente vira WAITING_HUMAN em vez de travar', async () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=codex', '--action=implement', `--repo=${repo}`], repo,
+    { BASTAO_CODEX: path.join(ROOT, 'nao-existe.exe') });
+
+  let state = null;
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    await new Promise(r => setTimeout(r, 100));
+    state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+    if (state.status === 'WAITING_HUMAN') break;
+  }
+  assert.equal(state.status, 'WAITING_HUMAN');
+  assert.equal(state.ask_human?.from, 'codex');
+});
+
+test('install: settings.json com BOM é lido; inválido não é sobrescrito', () => {
+  const fakeHome = fs.mkdtempSync(path.join(ROOT, 'fake-home-'));
+  const settingsFile = path.join(fakeHome, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+
+  fs.writeFileSync(settingsFile, '﻿{"theme":"dark"}', 'utf8');
+  assert.equal(runCli(['install', '--yes', `--home=${fakeHome}`], fakeHome).status, 0);
+  const raw = fs.readFileSync(settingsFile);
+  assert.equal(raw[0], 0x7B);
+  assert.equal(JSON.parse(raw.toString('utf8')).theme, 'dark');
+
+  fs.writeFileSync(settingsFile, '{quebrado', 'utf8');
+  const res = runCli(['install', '--yes', `--home=${fakeHome}`], fakeHome);
+  assert.equal(res.status, 1);
+  assert.equal(fs.readFileSync(settingsFile, 'utf8'), '{quebrado');
+});
 
 

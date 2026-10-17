@@ -14,6 +14,8 @@ export class BastaoError extends Error {
 
 export const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+export const AGENTS = ['claude', 'gemini', 'codex', 'human'];
+
 export function parseRoles(str) {
   if (!str || typeof str !== 'string') return null;
   const res = { implement: 'gemini', review: ['claude'] };
@@ -40,7 +42,7 @@ export function initState({
   codexThread = null
 }, now = new Date().toISOString()) {
   const reviewList = Array.isArray(review) ? review : [review];
-  const stateSlug = slug || (task ? task.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : 'ciclo');
+  const stateSlug = slug || (task ? task.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : 'ciclo');
   return {
     version: 2,
     task,
@@ -79,6 +81,9 @@ export function applyPass(state, {
   roles = null,
   force = false
 }, now = new Date().toISOString()) {
+  for (const who of [from, to]) {
+    if (!AGENTS.includes(who)) throw new BastaoError(`Agente inválido: ${who} (use ${AGENTS.join(', ')})`, 'INVALID_ARGS');
+  }
   if (!force) {
     if (state.status === 'WAITING_HUMAN') {
       const allowedFrom = state.ask_human?.from;
@@ -278,25 +283,16 @@ export function ensureExclude(repo) {
 }
 
 export function sendAgentApiMessage(wakeId, text) {
-  const custom = process.env.BASTAO_AGENTAPI;
-  if (custom) {
-    if (custom.endsWith('.mjs')) {
-      const res = spawnSync(process.execPath, [custom, 'send-message', '--title=Bastao', wakeId, text], {
-        encoding: 'utf8'
-      });
-      return res.status === 0;
-    }
-    const res = spawnSync(custom, ['send-message', '--title=Bastao', wakeId, text], {
-      encoding: 'utf8',
-      shell: true
-    });
-    return res.status === 0;
+  const bin = process.env.BASTAO_AGENTAPI
+    || path.join(process.env.USERPROFILE || '', '.gemini', 'antigravity-ide', 'bin', 'agentapi.bat');
+  if (bin.endsWith('.mjs')) {
+    return spawnSync(process.execPath, [bin, 'send-message', '--title=Bastao', wakeId, text], { windowsHide: true }).status === 0;
   }
-  const userProfile = process.env.USERPROFILE || '';
-  const batPath = path.join(userProfile, '.gemini', 'antigravity-ide', 'bin', 'agentapi.bat');
-  const res = spawnSync('cmd.exe', ['/d', '/s', '/c', `"${batPath}" send-message --title=Bastao ${wakeId} "${text}"`], {
-    encoding: 'utf8',
-    windowsHide: true
+  // cmd /s /c remove o primeiro e o último ", por isso a linha inteira vai entre aspas e sem o escape do libuv.
+  // wakeId é validado no wait e o texto é fixo (sem & | < > ^ " %).
+  const res = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${bin}" send-message --title=Bastao ${wakeId} "${text}""`], {
+    windowsHide: true,
+    windowsVerbatimArguments: true
   });
   return res.status === 0;
 }
@@ -340,7 +336,7 @@ export function findCodex() {
     try {
       const dirs = fs.readdirSync(extensionsDir)
         .filter(name => name.startsWith('openai.chatgpt-'))
-        .sort((a, b) => b.localeCompare(a));
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
       for (const d of dirs) {
         const candidate = path.join(extensionsDir, d, 'bin', 'windows-x86_64', 'codex.exe');
         if (fs.existsSync(candidate)) {
@@ -384,7 +380,7 @@ export async function main() {
         home: { type: 'string' }
       },
       allowPositionals: true,
-      strict: false
+      strict: true
     });
 
     const home = values.home || process.env.USERPROFILE || process.env.HOME || '';
@@ -433,9 +429,9 @@ export async function main() {
       let settings = {};
       if (fs.existsSync(claudeSettingsFile)) {
         try {
-          settings = JSON.parse(fs.readFileSync(claudeSettingsFile, 'utf8'));
+          settings = JSON.parse(fs.readFileSync(claudeSettingsFile, 'utf8').replace(/^﻿/, ''));
         } catch {
-          settings = {};
+          throw new BastaoError(`settings.json inválido em ${claudeSettingsFile}; corrija-o antes (nada foi alterado nele)`, 'CORRUPT_SETTINGS');
         }
       }
       settings.permissions = settings.permissions || {};
@@ -453,20 +449,18 @@ export async function main() {
 
     if (!isDryRun && !values.home) {
       const toolDir = path.dirname(currentFile);
-      try {
-        const psCmd = `
-          $cur = [Environment]::GetEnvironmentVariable('Path', 'User')
-          $target = '${toolDir.replace(/'/g, "''")}'
-          if ($cur -notlike "*$target*") {
-            $new = if ($cur) { "$cur;$target" } else { $target }
-            [Environment]::SetEnvironmentVariable('Path', $new, 'User')
-          }
-        `;
-        spawnSync('powershell', ['-NoProfile', '-Command', psCmd], { windowsHide: true });
-        console.log(`  ✓ Adicionado ao PATH do usuário: ${toolDir}`);
-      } catch (err) {
-        console.warn(`  ✗ Não foi possível atualizar o PATH automaticamente: ${err.message}`);
-      }
+      const psCmd = `
+        $cur = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $target = '${toolDir.replace(/'/g, "''")}'
+        if ($cur -notlike "*$target*") {
+          $new = if ($cur) { "$cur;$target" } else { $target }
+          [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+        }
+      `;
+      const ps = spawnSync('powershell', ['-NoProfile', '-Command', psCmd], { windowsHide: true });
+      console.log(ps.status === 0
+        ? `  ✓ Adicionado ao PATH do usuário: ${toolDir}`
+        : `  ✗ Não foi possível atualizar o PATH do usuário: ${toolDir}`);
     } else if (isDryRun && !values.home) {
       const toolDir = path.dirname(currentFile);
       console.log(`  [dry-run] Adicionaria ao PATH do usuário: ${toolDir}`);
@@ -479,7 +473,7 @@ export async function main() {
   let repoPath = null;
   if (repoArgIndex !== -1) {
     if (rest[repoArgIndex].startsWith('--repo=')) {
-      repoPath = rest[repoArgIndex].split('=')[1];
+      repoPath = rest[repoArgIndex].slice('--repo='.length);
     } else if (rest[repoArgIndex + 1]) {
       repoPath = rest[repoArgIndex + 1];
     }
@@ -503,7 +497,7 @@ export async function main() {
         repo: { type: 'string' }
       },
       allowPositionals: true,
-      strict: false
+      strict: true
     });
 
     if (!values.task || !values.spec || !values.plan) {
@@ -549,7 +543,7 @@ export async function main() {
         repo: { type: 'string' }
       },
       allowPositionals: true,
-      strict: false
+      strict: true
     });
 
     if (!values.from) throw new BastaoError('Comando pass exige --from', 'INVALID_ARGS');
@@ -596,7 +590,7 @@ export async function main() {
         repo: { type: 'string' }
       },
       allowPositionals: true,
-      strict: false
+      strict: true
     });
 
     if (!values.from || !values.question) {
@@ -657,7 +651,7 @@ export async function main() {
         repo: { type: 'string' }
       },
       allowPositionals: true,
-      strict: false
+      strict: true
     });
 
     if (!values.for) {
@@ -665,6 +659,13 @@ export async function main() {
     }
 
     const forAgent = values.for;
+    if (!['claude', 'gemini', 'codex'].includes(forAgent)) {
+      throw new BastaoError(`Agente inválido: ${forAgent}`, 'INVALID_ARGS');
+    }
+    if (values.wake && !/^[\w-]+$/.test(values.wake)) {
+      throw new BastaoError(`--wake inválido: ${values.wake} (use o Conversation ID)`, 'INVALID_ARGS');
+    }
+    if (!(await readState(repo))) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
     const lockPath = path.join(repo, '.agents', `wait-${forAgent}.lock`);
 
     if (isLockAlive(lockPath)) {
@@ -763,8 +764,6 @@ export async function main() {
       return;
     }
 
-    const codexBin = findCodex();
-
     let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', repo];
     if (state.conversations?.codex) {
       codexArgs.push('resume', state.conversations.codex);
@@ -781,30 +780,43 @@ export async function main() {
     const separator = `\n=== Round ${state.round}/${state.max_rounds} · ${state.action} · ${nowTime} ===\n`;
     fs.appendFileSync(logPath, separator, 'utf8');
 
-    const isNodeScript = codexBin.endsWith('.mjs');
-    const execCmd = isNodeScript ? process.execPath : codexBin;
-    const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
-
-    const child = spawn(execCmd, finalArgs, {
-      cwd: repo,
-      windowsHide: true,
-      env: process.env
-    });
-
-    child.stdin.write(prompt, 'utf8');
-    child.stdin.end();
-
+    // Qualquer falha (Codex ausente, spawn recusado) cai no applyAsk abaixo em vez de deixar o ciclo preso em codex.
+    // ponytail: um codex.cmd de npm não roda sem shell; se aparecer, aponte BASTAO_CODEX para o .exe.
     let fullOutput = '';
-    child.stdout.on('data', chunk => {
-      fullOutput += chunk.toString('utf8');
-      fs.appendFileSync(logPath, chunk);
-    });
-    child.stderr.on('data', chunk => {
-      fullOutput += chunk.toString('utf8');
-      fs.appendFileSync(logPath, chunk);
-    });
+    let exitCode;
+    try {
+      const codexBin = findCodex();
+      const isNodeScript = codexBin.endsWith('.mjs');
+      const execCmd = isNodeScript ? process.execPath : codexBin;
+      const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
 
-    const exitCode = await new Promise(resolve => child.on('close', resolve));
+      const child = spawn(execCmd, finalArgs, {
+        cwd: repo,
+        windowsHide: true,
+        env: process.env
+      });
+
+      child.stdin.on('error', () => {});
+      child.stdin.write(prompt, 'utf8');
+      child.stdin.end();
+
+      child.stdout.on('data', chunk => {
+        fullOutput += chunk.toString('utf8');
+        fs.appendFileSync(logPath, chunk);
+      });
+      child.stderr.on('data', chunk => {
+        fullOutput += chunk.toString('utf8');
+        fs.appendFileSync(logPath, chunk);
+      });
+
+      exitCode = await new Promise(resolve => {
+        child.on('error', err => resolve(err.message));
+        child.on('close', resolve);
+      });
+    } catch (err) {
+      exitCode = err.message;
+    }
+    if (typeof exitCode === 'string') fs.appendFileSync(logPath, `bastao: ${exitCode}\n`, 'utf8');
 
     if (!state.conversations?.codex) {
       const m = fullOutput.match(/session id:\s*([a-zA-Z0-9_-]+)/i);
@@ -839,7 +851,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     await main();
   } catch (err) {
-    if (err instanceof BastaoError) {
+    if (err instanceof BastaoError || err.code?.startsWith('ERR_PARSE_ARGS')) {
       console.error(`bastao: ${err.message}`);
       process.exit(1);
     }

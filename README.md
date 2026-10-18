@@ -1,5 +1,7 @@
 # bastão (antigravity)
 
+**English** · [Português](README.pt-BR.md)
+
 Hands-off relay between **Claude Code**, **Gemini** and **Codex** inside the **Antigravity IDE**. You approve a spec and a plan once; from there the agents pass the "baton" to each other on their own: implement, review, fix, review again, until the work is approved or they need you. No copy-pasting between chats, no prompting each agent by hand.
 
 You stay in control: watch any agent's conversation as it happens, jump in at any moment, pause the cycle, change who does what, or answer a question an agent raised.
@@ -91,16 +93,6 @@ All commands accept `--repo=<dir>`. Set `BASTAO_NOTIFY=off` to silence popups, `
 ```powershell
 node --test test.mjs
 ```
-
----
-
-## Em português
-
-O bastão automatiza o revezamento entre Claude Code, Gemini e Codex dentro do Antigravity. Você aprova a spec e o plano uma vez; depois disso os agentes passam a vez entre si sozinhos (implementar, revisar, corrigir) até aprovar ou precisarem de você. Você pode acompanhar qualquer conversa, intervir quando quiser, pausar (`bastao pause`) e devolver (`bastao pass --from=human …`). Dúvidas, aprovação e limite de rodadas geram um popup.
-
-**Codex:** por limitação da extensão, o painel do Codex no Antigravity não mostra os turnos feitos pelo bastão. Ele roda em segundo plano (`codex exec`, mesma thread a cada rodada, com memória), e a saída fica em `.agents/live/codex.log` (acompanhe com `Get-Content .agents\live\codex.log -Wait`). Para ver no painel, use **Developer: Reload Window**. Se o Codex parar sem passar o bastão, o ciclo vai para "aguardando humano" com popup, em vez de travar.
-
-Instalação: clone em `%USERPROFILE%\.agents\bastao`, rode `node bastao.mjs install --yes` e **reinicie o terminal**. Ative a execução automática de comandos no Antigravity, senão o Gemini para a cada comando. Comece sempre por `bastao status`; com ciclo ativo use `pass`, nunca `init`.
 
 ## License
 

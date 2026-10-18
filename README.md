@@ -22,7 +22,7 @@ The agent-side rules are in [SKILL.md](SKILL.md), which `install` copies to each
 Requires Node.js 18+ and git.
 
 ```powershell
-git clone https://github.com/egobeth/bastao "$env:USERPROFILE\.agents\bastao"
+git clone https://github.com/egobeth/bastao-antigravity "$env:USERPROFILE\.agents\bastao"
 node "$env:USERPROFILE\.agents\bastao\bastao.mjs" install        # dry run: shows what it would change
 node "$env:USERPROFILE\.agents\bastao\bastao.mjs" install --yes  # apply
 ```

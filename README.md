@@ -1,25 +1,58 @@
-# bastão
+# bastão (antigravity)
 
-Turn-passing ("baton") protocol for coding agents working on the same git repo: **Claude Code**, **Gemini (Antigravity)** and **Codex** take turns to spec, implement and review, one at a time, with a shared state file as the single source of truth.
+Hands-off relay between **Claude Code**, **Gemini** and **Codex** inside the **Antigravity IDE**. You approve a spec and a plan once; from there the agents pass the "baton" to each other on their own: implement, review, fix, review again, until the work is approved or they need you. No copy-pasting between chats, no prompting each agent by hand.
 
-Single file, zero dependencies, Node.js only.
+You stay in control: watch any agent's conversation as it happens, jump in at any moment, pause the cycle, change who does what, or answer a question an agent raised.
 
-> **Windows-first.** Notifications use `msg`, waking Gemini uses Antigravity's `agentapi.bat`, and Codex is located with `where`. The state machine itself is portable; the rest welcomes PRs.
+Single file, zero dependencies, Node.js only. Works with your existing subscriptions; no API keys.
 
-## How it works
+## What runs on its own, and where you come in
 
-- State lives in `.agents/turn.json` at the repo root (kept out of git via `.git/info/exclude`).
-- Default roles: Claude writes spec/plan and reviews, Gemini implements, Codex implements or reviews.
-- A cycle goes `spec → implement → review → (fix → review)… → done`, up to `--max-rounds` (default 3).
-- Agents waiting for their turn run `bastao wait` in the background; it exits (and wakes Gemini) when the turn arrives.
-- Passing to Codex launches `codex exec` automatically; output goes to `.agents/live/codex.log`.
-- Any agent can stop and ask the human (`bastao ask`); the human takes over with `bastao pause`.
+| Automatic | Only if you want (or are asked) |
+|---|---|
+| Handing the turn to the next agent | Approving spec and plan before the cycle starts (the one built-in gate) |
+| Waking the agent whose turn it is | Typing in any agent's chat mid-cycle |
+| Implement → review → fix loops, up to `--max-rounds` | `bastao pause` to take over, `bastao pass --from=human …` to hand back |
+| Evidence of each turn in `docs/evidence/` | Answering when an agent runs `bastao ask` (you get a popup) |
+| Stopping when approved or out of rounds (popup) | Switching roles or skills: `--roles=implement:codex,review:claude+gemini` |
 
-The agent-side rules are in [SKILL.md](SKILL.md), which `install` copies to each agent's skills folder.
+Agents work on an `ai/<slug>` branch and never merge, push or deploy without you.
+
+## How a cycle runs
+
+1. You and Claude write the spec and plan. You approve them; Claude runs `bastao init` and passes to the implementer.
+2. Each agent, when its turn ends, runs `bastao pass` and goes to sleep.
+3. The next agent wakes up by itself:
+   - **Gemini**: a background `bastao wait` sends a message to its Antigravity conversation (via Antigravity's `agentapi`), which resumes it.
+   - **Claude Code**: a background `bastao wait` finishes and Claude Code resumes the session.
+   - **Codex**: `bastao pass --to=codex` launches `codex exec` directly (see below).
+4. The reviewer either sends fixes back (`fix`, next round) or approves (`done`). Anything that needs you raises a popup.
+
+State lives in `.agents/turn.json` at the repo root, kept out of git automatically. The agent rules are in [SKILL.md](SKILL.md).
+
+## Codex: runs in the background, not in your open chat
+
+The Codex panel in Antigravity does **not** refresh with turns made from outside it; that's a limitation of the Codex extension, not something bastão can fix. So Codex works like this:
+
+- Its turns run headless with `codex exec` (sandbox `workspace-write` in your repo), resuming the same Codex thread each round, so it keeps its memory of the cycle. Pass `--codex-thread=<id>` to `init` to continue a thread you already have open.
+- Everything it prints is appended live to **`.agents/live/codex.log`**, with a `=== Round r/m · action · HH:MM ===` header per turn. Follow it with:
+  ```powershell
+  Get-Content .agents\live\codex.log -Wait
+  ```
+- To see those turns in the Codex panel itself, run **Developer: Reload Window** in Antigravity.
+- If Codex exits without passing the baton (crash, missing binary, it simply stopped), the cycle switches to "waiting for human" with a popup instead of hanging. Answer with:
+  `bastao pass --from=human --to=codex --action=<action> --force --notes="<your answer>"`
+
+## Requirements
+
+- Windows, Node.js 18+, git.
+- Antigravity IDE with the Claude Code and Codex (OpenAI) extensions, logged in.
+- **Turn on auto-run for terminal commands in Antigravity** (`bastao`, `git`, `node`, your tests). Otherwise Gemini stops for approval at every command and the relay stalls.
+- Keep the agents' conversations open in Antigravity; a closed Claude Code session can't be resumed by its watcher. Gemini's wake-up works only when started from an Antigravity agent terminal.
+
+> Windows-first: popups use `msg`, Gemini is woken with `agentapi.bat`, Codex is found with `where`. The state machine is portable; PRs for other platforms welcome.
 
 ## Install
-
-Requires Node.js 18+ and git.
 
 ```powershell
 git clone https://github.com/egobeth/bastao-antigravity "$env:USERPROFILE\.agents\bastao"
@@ -34,7 +67,7 @@ Then **restart your terminal** so `bastao` is on the PATH. Until then, call `nod
 - adds `Bash(bastao:*)` and `PowerShell(bastao:*)` to the allow list in `~/.claude/settings.json`;
 - appends the tool folder to your user `PATH`.
 
-**Heads-up:** `bastao pass --to=codex` runs Codex unattended with `--sandbox workspace-write` in your repo.
+Projects need no setup of their own: once spec and plan are approved, ask any agent to "start the bastão".
 
 ## Usage
 
@@ -49,7 +82,7 @@ bastao pass --from=human --to=gemini --action=implement --force --notes="Keep it
 bastao --help                                   # all options
 ```
 
-All commands accept `--repo=<dir>`. Set `BASTAO_NOTIFY=off` to silence notifications, `BASTAO_CODEX` / `BASTAO_AGENTAPI` to override binary paths.
+All commands accept `--repo=<dir>`. Set `BASTAO_NOTIFY=off` to silence popups, `BASTAO_CODEX` / `BASTAO_AGENTAPI` to override binary paths.
 
 `wait` exit codes: `0` your turn · `2` timeout, re-arm · `3` cycle approved/paused/out of rounds · `4` a watcher is already running · `5` failed to wake Gemini.
 
@@ -63,9 +96,11 @@ node --test test.mjs
 
 ## Em português
 
-O bastão coordena Claude Code, Gemini (Antigravity) e Codex no mesmo repositório: um de cada vez, com `.agents/turn.json` como fonte da verdade. Por padrão o Claude especifica e revisa, o Gemini implementa e o Codex implementa ou revisa.
+O bastão automatiza o revezamento entre Claude Code, Gemini e Codex dentro do Antigravity. Você aprova a spec e o plano uma vez; depois disso os agentes passam a vez entre si sozinhos (implementar, revisar, corrigir) até aprovar ou precisarem de você. Você pode acompanhar qualquer conversa, intervir quando quiser, pausar (`bastao pause`) e devolver (`bastao pass --from=human …`). Dúvidas, aprovação e limite de rodadas geram um popup.
 
-Instalação: clone em `%USERPROFILE%\.agents\bastao`, rode `node bastao.mjs install --yes` e **reinicie o terminal**. O `install` copia a skill para os três agentes, libera `bastao` no Claude Code e põe a pasta no PATH. Comece sempre por `bastao status`; com ciclo ativo use `pass`, nunca `init`. As regras de cada agente estão no [SKILL.md](SKILL.md).
+**Codex:** por limitação da extensão, o painel do Codex no Antigravity não mostra os turnos feitos pelo bastão. Ele roda em segundo plano (`codex exec`, mesma thread a cada rodada, com memória), e a saída fica em `.agents/live/codex.log` (acompanhe com `Get-Content .agents\live\codex.log -Wait`). Para ver no painel, use **Developer: Reload Window**. Se o Codex parar sem passar o bastão, o ciclo vai para "aguardando humano" com popup, em vez de travar.
+
+Instalação: clone em `%USERPROFILE%\.agents\bastao`, rode `node bastao.mjs install --yes` e **reinicie o terminal**. Ative a execução automática de comandos no Antigravity, senão o Gemini para a cada comando. Comece sempre por `bastao status`; com ciclo ativo use `pass`, nunca `init`.
 
 ## License
 

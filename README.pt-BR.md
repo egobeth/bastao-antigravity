@@ -65,7 +65,7 @@ node "$env:USERPROFILE\.agents\bastao\bastao.mjs" install --yes  # aplica
 Depois **reinicie o terminal** para o `bastao` entrar no PATH. Até lá, chame `node ...\bastao.mjs` direto.
 
 O `install --yes` altera a sua máquina:
-- copia o `SKILL.md` para `~/.claude/skills/bastao`, `~/.gemini/antigravity/skills/bastao` e `~/.codex/skills/bastao`;
+- copia o `SKILL.md` para `~/.claude/skills/bastao`, `~/.gemini/config/skills/bastao` e `~/.codex/skills/bastao`;
 - adiciona `Bash(bastao:*)` e `PowerShell(bastao:*)` à lista de permissões em `~/.claude/settings.json`;
 - acrescenta a pasta da ferramenta ao `PATH` do usuário.
 

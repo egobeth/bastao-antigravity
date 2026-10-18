@@ -412,7 +412,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     const skillSource = path.join(path.dirname(currentFile), 'SKILL.md');
     const destinations = [
       path.join(home, '.claude', 'skills', 'bastao', 'SKILL.md'),
-      path.join(home, '.gemini', 'antigravity', 'skills', 'bastao', 'SKILL.md'),
+      path.join(home, '.gemini', 'config', 'skills', 'bastao', 'SKILL.md'),
       path.join(home, '.codex', 'skills', 'bastao', 'SKILL.md')
     ];
 

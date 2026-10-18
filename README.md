@@ -65,7 +65,7 @@ node "$env:USERPROFILE\.agents\bastao\bastao.mjs" install --yes  # apply
 Then **restart your terminal** so `bastao` is on the PATH. Until then, call `node ...\bastao.mjs` directly.
 
 `install --yes` changes your machine:
-- copies `SKILL.md` to `~/.claude/skills/bastao`, `~/.gemini/antigravity/skills/bastao` and `~/.codex/skills/bastao`;
+- copies `SKILL.md` to `~/.claude/skills/bastao`, `~/.gemini/config/skills/bastao` and `~/.codex/skills/bastao`;
 - adds `Bash(bastao:*)` and `PowerShell(bastao:*)` to the allow list in `~/.claude/settings.json`;
 - appends the tool folder to your user `PATH`.
 

@@ -735,7 +735,7 @@ test('install: sem --yes apenas exibe acoes sem alterar nada', () => {
   assert.equal(res.status, 0);
 
   const claudeSkill = path.join(fakeHome, '.claude', 'skills', 'bastao', 'SKILL.md');
-  const geminiSkill = path.join(fakeHome, '.gemini', 'antigravity', 'skills', 'bastao', 'SKILL.md');
+  const geminiSkill = path.join(fakeHome, '.gemini', 'config', 'skills', 'bastao', 'SKILL.md');
   const codexSkill = path.join(fakeHome, '.codex', 'skills', 'bastao', 'SKILL.md');
   const settingsFile = path.join(fakeHome, '.claude', 'settings.json');
 
@@ -762,7 +762,7 @@ test('install: com --yes instala skill nos 3 destinos e atualiza settings.json p
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
 
   const claudeSkill = path.join(fakeHome, '.claude', 'skills', 'bastao', 'SKILL.md');
-  const geminiSkill = path.join(fakeHome, '.gemini', 'antigravity', 'skills', 'bastao', 'SKILL.md');
+  const geminiSkill = path.join(fakeHome, '.gemini', 'config', 'skills', 'bastao', 'SKILL.md');
   const codexSkill = path.join(fakeHome, '.codex', 'skills', 'bastao', 'SKILL.md');
 
   assert.ok(fs.existsSync(claudeSkill), 'Skill deve existir no Claude');

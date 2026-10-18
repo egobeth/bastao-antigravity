@@ -367,8 +367,16 @@ export async function main() {
   const command = args[0];
   const rest = args.slice(1);
 
-  if (!command || ['--help', '-h', 'help'].includes(command)) {
-    console.log('Uso: bastao <init|pass|ask|pause|status|wait|install> [opções]');
+  if (!command || ['--help', '-h', 'help'].includes(command) || rest.includes('--help') || rest.includes('-h')) {
+    console.log(`Uso: bastao <comando> [opções]
+  status
+  init    --task= --spec= --plan= [--slug=] [--implement=gemini] [--review=claude,codex] [--max-rounds=3] [--codex-thread=] [--force]
+  pass    --from= --to= --action= [--notes=] [--evidence=] [--skills=a,b] [--roles=implement:x,review:y+z] [--force]
+  ask     --from= --question=
+  pause
+  wait    --for=<claude|gemini|codex> [--wake=<id>] [--timeout-min=240]
+  install [--yes]
+Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'.`);
     return;
   }
 
@@ -552,6 +560,13 @@ export async function main() {
 
     const state = await readState(repo);
     if (!state) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
+
+    // Repetir um pass que já foi aplicado não é erro: evita o "Não é a sua vez" que faz o agente tentar de novo.
+    if (!values.force && state.status === 'IN_PROGRESS' && values.from !== state.current_turn
+      && state.current_turn === values.to && state.action === values.action) {
+      console.log(`bastao: o bastão já está com ${state.current_turn} (${state.action}); nada a fazer`);
+      return;
+    }
 
     const { state: nextState, notify: notifyMsg } = applyPass(state, {
       from: values.from,

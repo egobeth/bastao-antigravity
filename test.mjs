@@ -857,3 +857,17 @@ test('install: settings.json com BOM é lido; inválido não é sobrescrito', ()
 });
 
 
+
+test('--help em subcomando mostra uso e pass repetido é no-op', () => {
+  const repo = tempRepo();
+  const help = runCli(['init', '--help'], repo);
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /init\s+--task=/);
+
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(runCli(['pass', '--from=human', '--to=claude', '--action=plan', '--force', `--repo=${repo}`], repo).status, 0);
+  const again = runCli(['pass', '--from=human', '--to=claude', '--action=plan', `--repo=${repo}`], repo);
+  assert.equal(again.status, 0, `stderr: ${again.stderr}`);
+  assert.match(again.stdout, /já está com claude/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8')).history.length, 1);
+});

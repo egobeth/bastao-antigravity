@@ -103,4 +103,6 @@ Depois, `bastao pass --from=claude --to=<implementador> --action=implement --not
 - Quando o usuário responder no chat, continue o turno normalmente e passe o bastão com `bastao pass ...`.
 
 ## 4. Pré-requisitos e Execução Automática
+- `bastao` não reconhecido (terminal aberto antes do install)? Não investigue: use `node $env:USERPROFILE\.agents\bastao\bastao.mjs <comando>` ou reinicie o terminal.
+- Comece sempre por `bastao status`. Ciclo ativo → `pass`, nunca `init`. Opções de todos os comandos: `bastao --help`.
 - No Antigravity: configure a execução automática para comandos de terminal (`bastao`, `git`, `node`, testes).

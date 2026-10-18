@@ -69,4 +69,4 @@ Instalação: clone em `%USERPROFILE%\.agents\bastao`, rode `node bastao.mjs ins
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © Eduardo Gobeth

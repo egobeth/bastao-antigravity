@@ -19,13 +19,19 @@ export const AGENTS = ['claude', 'gemini', 'codex', 'human'];
 export function parseRoles(str) {
   if (!str || typeof str !== 'string') return null;
   const res = { implement: 'gemini', review: ['claude'] };
-  const parts = str.split(',');
-  for (const part of parts) {
-    const [k, v] = part.split(':').map(s => s && s.trim());
-    if (k === 'implement' && v) {
-      res.implement = v;
-    } else if (k === 'review' && v) {
-      res.review = v.split('+').map(s => s.trim()).filter(Boolean);
+  const checkAgent = a => {
+    if (!['claude', 'gemini', 'codex'].includes(a)) throw new BastaoError(`--roles: agente inválido "${a}" (use claude, gemini, codex)`, 'INVALID_ARGS');
+    return a;
+  };
+  for (const part of str.split(',').map(s => s.trim()).filter(Boolean)) {
+    const [k, v] = part.split(':').map(s => s.trim());
+    if (!v) throw new BastaoError(`--roles: "${part}" sem papel (vários revisores vão com +: review:claude+codex)`, 'INVALID_ARGS');
+    if (k === 'implement') {
+      res.implement = checkAgent(v);
+    } else if (k === 'review') {
+      res.review = v.split('+').map(s => s.trim()).filter(Boolean).map(checkAgent);
+    } else {
+      throw new BastaoError(`--roles: papel desconhecido "${k}" (use implement, review)`, 'INVALID_ARGS');
     }
   }
   return res;

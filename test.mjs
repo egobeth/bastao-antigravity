@@ -39,6 +39,13 @@ test('parseRoles extrai implement e review corretamente', () => {
   });
 });
 
+test('parseRoles recusa parte sem ":", papel desconhecido e agente inválido', () => {
+  assert.throws(() => parseRoles('implement:gemini, review:claude, codex'), /"codex".*\+/);
+  assert.throws(() => parseRoles('implementer:gemini'), /implementer/);
+  assert.throws(() => parseRoles('review:claude+codx'), /codx/);
+  assert.deepEqual(parseRoles('implement:codex,'), { implement: 'codex', review: ['claude'] });
+});
+
 test('init cria turn.json com current_turn:claude e linhas no exclude sem duplicar', () => {
   const repo = tempRepo();
   const res = runCli([

@@ -62,7 +62,7 @@ node "$env:USERPROFILE\.agents\bastao\bastao.mjs" install        # dry run: show
 node "$env:USERPROFILE\.agents\bastao\bastao.mjs" install --yes  # apply
 ```
 
-Then **restart your terminal** so `bastao` is on the PATH. Until then, call `node ...\bastao.mjs` directly.
+Then **restart your terminal** so `bastao` is on the PATH (it works in PowerShell, cmd and Git Bash). Until then, call `node ...\bastao.mjs` directly.
 
 `install --yes` changes your machine:
 - copies `SKILL.md` to `~/.claude/skills/bastao`, `~/.gemini/config/skills/bastao` and `~/.codex/skills/bastao`;

@@ -4,7 +4,17 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseRoles } from './bastao.mjs';
-import { BASTAO_CLI, ROOT, runCli, tempRepo } from './testutil.mjs';
+import { BASTAO_CLI, ROOT, runCli, tempRepo, git } from './testutil.mjs';
+
+// Ciclo único do repo de teste (nenhum antes do init).
+function unicoCiclo(repo) {
+  const dir = path.join(repo, '.agents', 'ciclos');
+  const nomes = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.json')) : [];
+  return nomes.length === 1 ? nomes[0].slice(0, -5) : null;
+}
+const alvo = repo => (unicoCiclo(repo) ? [`--repo=${repo}`, `--ciclo=${unicoCiclo(repo)}`] : [`--repo=${repo}`]);
+const estadoPath = repo => path.join(repo, '.agents', 'ciclos', `${unicoCiclo(repo)}.json`);
+const lockPath = (repo, agente) => path.join(repo, '.agents', 'ciclos', `${unicoCiclo(repo)}.wait-${agente}.lock`);
 
 test('parseRoles extrai implement e review corretamente', () => {
   const roles = parseRoles('implement:codex,review:claude+gemini');
@@ -21,7 +31,7 @@ test('parseRoles recusa parte sem ":", papel desconhecido e agente inválido', (
   assert.deepEqual(parseRoles('implement:codex,'), { implement: 'codex', review: ['claude'] });
 });
 
-test('init cria turn.json com current_turn:claude e linhas no exclude sem duplicar', () => {
+test('init cria worktree na branch ai/<slug>, estado v3, exclude sem duplicar e entrada no índice', () => {
   const repo = tempRepo();
   const res = runCli([
     'init',
@@ -29,31 +39,45 @@ test('init cria turn.json com current_turn:claude e linhas no exclude sem duplic
     '--slug=teste-fluxo',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
 
-  const turnPath = path.join(repo, '.agents', 'turn.json');
-  assert.ok(fs.existsSync(turnPath));
+  const turnPath = estadoPath(repo);
+  assert.equal(turnPath, path.join(repo, '.agents', 'ciclos', 'teste-fluxo.json'));
   const raw = fs.readFileSync(turnPath);
   assert.equal(raw[0], 0x7B, 'Arquivo deve iniciar com { (sem BOM)');
 
   const state = JSON.parse(raw.toString('utf8'));
+  assert.equal(state.version, 3);
   assert.equal(state.current_turn, 'claude');
   assert.equal(state.status, 'IN_PROGRESS');
   assert.equal(state.action, 'spec');
   assert.equal(state.round, 1);
   assert.equal(state.max_rounds, 3);
+  assert.equal(state.seq, 0);
+  assert.equal(state.worktree, '.worktrees/teste-fluxo');
+  assert.equal(state.parado_min, 15);
+  assert.equal(state.wake, null);
+  assert.equal(state.stall, null);
+
+  const wt = path.join(repo, '.worktrees', 'teste-fluxo');
+  assert.equal(git(wt, 'branch', '--show-current').stdout.trim(), 'ai/teste-fluxo');
+  assert.match(res.stdout, /npm install/);
+  assert.ok(res.stdout.includes(wt), 'imprime o caminho do worktree');
+
+  const indice = JSON.parse(fs.readFileSync(process.env.BASTAO_INDEX, 'utf8'));
+  assert.ok(indice.ciclos.some(c => c.repo === repo && c.slug === 'teste-fluxo'));
 
   const excludePath = path.join(repo, '.git', 'info', 'exclude');
   const excludeContent = fs.readFileSync(excludePath, 'utf8');
-  assert.ok(excludeContent.includes('.agents/turn.json'));
-  assert.ok(excludeContent.includes('.agents/turn.json.tmp'));
-  assert.ok(excludeContent.includes('.agents/*.lock'));
-  assert.ok(excludeContent.includes('.agents/live/'));
+  for (const linha of ['.agents/turn.json', '.agents/*.lock', '.agents/live/', '.agents/ciclos/', '.worktrees/']) {
+    assert.ok(excludeContent.includes(linha), linha);
+  }
+  assert.equal(git(repo, 'status', '--porcelain').stdout.trim(), '', 'pasta principal continua limpa');
 
-  // Rodar de novo com --force deve atualizar sem duplicar exclude
+  // Rodar de novo com --force reaproveita o worktree e não duplica o exclude
   const res2 = runCli([
     'init',
     '--task=Testar fluxo 2',
@@ -61,37 +85,76 @@ test('init cria turn.json com current_turn:claude e linhas no exclude sem duplic
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
     '--force',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
-  assert.equal(res2.status, 0);
+  assert.equal(res2.status, 0, `stderr: ${res2.stderr}`);
 
   const excludeContent2 = fs.readFileSync(excludePath, 'utf8');
-  const count = excludeContent2.split(/\r?\n/).map(l => l.trim()).filter(l => l === '.agents/turn.json').length;
+  const count = excludeContent2.split(/\r?\n/).map(l => l.trim()).filter(l => l === '.worktrees/').length;
   assert.equal(count, 1, 'Não deve duplicar linhas no exclude');
 });
 
-test('segundo init com ciclo ativo falha com código 1', () => {
+test('init: mesmo slug falha, slug diferente cria segundo ciclo e segundo worktree', () => {
   const repo = tempRepo();
-  const res1 = runCli([
-    'init',
-    '--task=Testar fluxo',
-    '--slug=teste-fluxo',
-    '--spec=docs/spec.md',
-    '--plan=docs/plan.md',
-    `--repo=${repo}`
-  ], repo);
-  assert.equal(res1.status, 0);
+  const init = slug => runCli(['init', `--task=${slug}`, `--slug=${slug}`, '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(init('um').status, 0);
+  const repetido = init('um');
+  assert.equal(repetido.status, 1);
+  assert.match(repetido.stderr, /já existe/i);
+  const outro = init('dois');
+  assert.equal(outro.status, 0, `stderr: ${outro.stderr}`);
+  assert.ok(fs.existsSync(path.join(repo, '.agents', 'ciclos', 'um.json')));
+  assert.ok(fs.existsSync(path.join(repo, '.agents', 'ciclos', 'dois.json')));
+  assert.equal(git(path.join(repo, '.worktrees', 'dois'), 'branch', '--show-current').stdout.trim(), 'ai/dois');
+});
 
-  const res2 = runCli([
-    'init',
-    '--task=Outro fluxo',
-    '--slug=outro-fluxo',
-    '--spec=docs/spec2.md',
-    '--plan=docs/plan2.md',
-    `--repo=${repo}`
-  ], repo);
-  assert.equal(res2.status, 1);
-  assert.match(res2.stderr, /ciclo ativo/i);
+test('init reaproveita branch ai/<slug> existente', () => {
+  const repo = tempRepo();
+  git(repo, 'branch', 'ai/existente');
+  git(repo, 'commit', '--allow-empty', '-m', 'depois da branch');
+  const res = runCli(['init', '--task=t', '--slug=existente', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const wt = path.join(repo, '.worktrees', 'existente');
+  assert.equal(git(wt, 'rev-parse', 'HEAD').stdout, git(repo, 'rev-parse', 'ai/existente').stdout);
+});
+
+test('init recusa slug inválido sem criar nada', () => {
+  const repo = tempRepo();
+  const res = runCli(['init', '--task=t', '--slug=Meu Ciclo', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /slug/i);
+  assert.equal(git(repo, 'branch', '--list', 'ai/*').stdout.trim(), '');
+  assert.ok(!fs.existsSync(path.join(repo, '.agents', 'ciclos')));
+});
+
+test('init falha claro quando ai/<slug> está em uso na pasta principal', () => {
+  const repo = tempRepo();
+  git(repo, 'checkout', '-b', 'ai/x');
+  const before = fs.existsSync(process.env.BASTAO_INDEX) ? fs.readFileSync(process.env.BASTAO_INDEX, 'utf8') : '';
+  const res = runCli(['init', '--task=t', '--slug=x', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /ai\/x/);
+  assert.match(res.stderr, /em uso/i);
+  assert.doesNotMatch(res.stderr, /^\s+at\s+/m);
+  assert.ok(!fs.existsSync(path.join(repo, '.agents', 'ciclos', 'x.json')));
+  const after = fs.existsSync(process.env.BASTAO_INDEX) ? fs.readFileSync(process.env.BASTAO_INDEX, 'utf8') : '';
+  assert.equal(after, before);
+});
+
+test('init avisa spec/plano ausentes no worktree e config sem .worktrees', () => {
+  const repo = tempRepo();
+  fs.mkdirSync(path.join(repo, 'docs'));
+  fs.writeFileSync(path.join(repo, 'docs', 'spec.md'), 'spec');
+  fs.writeFileSync(path.join(repo, 'vitest.config.ts'), 'export default {}');
+  fs.writeFileSync(path.join(repo, 'eslint.config.js'), "export default [{ ignores: ['.worktrees/**'] }]");
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-m', 'base');
+  const res = runCli(['init', '--task=t', '--slug=avisos', '--spec=docs/spec.md', '--plan=docs/nao.md', `--repo=${repo}`], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.match(res.stdout, /docs\/nao\.md/);
+  assert.doesNotMatch(res.stdout, /docs\/spec\.md.*não/);
+  assert.match(res.stdout, /vitest\.config\.ts/);
+  assert.doesNotMatch(res.stdout, /eslint\.config\.js/);
 });
 
 test('pass com notas especiais preserva acentos, aspas, quebras e sem BOM', () => {
@@ -102,7 +165,7 @@ test('pass com notas especiais preserva acentos, aspas, quebras e sem BOM', () =
     '--slug=teste-fluxo',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   const specialNotes = 'ação "x" & 100%\nlinha2';
@@ -112,12 +175,12 @@ test('pass com notas especiais preserva acentos, aspas, quebras e sem BOM', () =
     '--to=gemini',
     '--action=implement',
     `--notes=${specialNotes}`,
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
 
-  const turnPath = path.join(repo, '.agents', 'turn.json');
+  const turnPath = estadoPath(repo);
   const raw = fs.readFileSync(turnPath);
   assert.equal(raw[0], 0x7B, 'Arquivo deve iniciar com { (sem BOM)');
 
@@ -136,10 +199,10 @@ test('pass de quem não está com o bastão falha com código 1 sem alterar turn
     '--slug=teste-fluxo',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
-  const turnPath = path.join(repo, '.agents', 'turn.json');
+  const turnPath = estadoPath(repo);
   const beforeBytes = fs.readFileSync(turnPath);
 
   const res = runCli([
@@ -147,7 +210,7 @@ test('pass de quem não está com o bastão falha com código 1 sem alterar turn
     '--from=gemini',
     '--to=claude',
     '--action=review',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   assert.equal(res.status, 1);
@@ -164,90 +227,90 @@ test('fluxo de rounds, fix, done, ask e pause', () => {
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
     '--max-rounds=3',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   // 1. Pass claude -> gemini (implement)
-  let res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  let res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
 
   // 2. gemini -> claude (review)
-  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
 
   // 3. claude -> gemini (fix round 2)
-  res = runCli(['pass', '--from=claude', '--to=gemini', '--action=fix', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=claude', '--to=gemini', '--action=fix', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  let state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  let state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.round, 2);
   assert.equal(state.current_turn, 'gemini');
 
   // gemini -> claude (review round 2)
-  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
 
   // claude -> gemini (fix round 3)
-  res = runCli(['pass', '--from=claude', '--to=gemini', '--action=fix', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=claude', '--to=gemini', '--action=fix', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.round, 3);
 
   // gemini -> claude (review round 3)
-  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
 
   // claude -> fix round 4 (ultrapassa max_rounds 3) -> MAX_ROUNDS_REACHED, current_turn: human
-  res = runCli(['pass', '--from=claude', '--to=gemini', '--action=fix', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=claude', '--to=gemini', '--action=fix', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'MAX_ROUNDS_REACHED');
   assert.equal(state.current_turn, 'human');
 
   // done com to!=human deve falhar
-  res = runCli(['pass', '--from=human', '--to=gemini', '--action=done', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=human', '--to=gemini', '--action=done', ...alvo(repo)], repo);
   assert.equal(res.status, 1);
 
   // Retomar de MAX_ROUNDS_REACHED pelo human
-  res = runCli(['pass', '--from=human', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=human', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'IN_PROGRESS');
   assert.equal(state.current_turn, 'gemini');
   assert.equal(state.round, 4); // round mantido
 
   // ask por gemini -> WAITING_HUMAN
-  res = runCli(['ask', '--from=gemini', '--question=Qual cor usar?', `--repo=${repo}`], repo);
+  res = runCli(['ask', '--from=gemini', '--question=Qual cor usar?', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'WAITING_HUMAN');
   assert.equal(state.ask_human.from, 'gemini');
   assert.equal(state.ask_human.question, 'Qual cor usar?');
 
   // pass de quem perguntou volta a IN_PROGRESS
-  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'IN_PROGRESS');
   assert.equal(state.ask_human, null);
 
   // pause -> MANUAL_PAUSE
-  res = runCli(['pause', `--repo=${repo}`], repo);
+  res = runCli(['pause', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'MANUAL_PAUSE');
   assert.equal(state.current_turn, 'human');
 
   // pass de human retoma mantendo round
-  res = runCli(['pass', '--from=human', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=human', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'IN_PROGRESS');
   assert.equal(state.current_turn, 'gemini');
 
   // done para human -> APPROVED
-  res = runCli(['pass', '--from=gemini', '--to=human', '--action=done', `--repo=${repo}`], repo);
+  res = runCli(['pass', '--from=gemini', '--to=human', '--action=done', ...alvo(repo)], repo);
   assert.equal(res.status, 0);
-  state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+  state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
   assert.equal(state.status, 'APPROVED');
   assert.equal(state.current_turn, 'human');
 });
@@ -260,7 +323,7 @@ test('status rodado de uma subpasta sem --repo detecta raiz git', () => {
     '--slug=teste-status',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   const subDir = path.join(repo, 'sub', 'pasta', 'interna');
@@ -279,7 +342,7 @@ test('turn.json inválido falha com código 1, mensagem clara e sem stack trace'
   const turnPath = path.join(agentsDir, 'turn.json');
   fs.writeFileSync(turnPath, '{quebrado', 'utf8');
 
-  const res = runCli(['status', `--repo=${repo}`], repo);
+  const res = runCli(['status', ...alvo(repo)], repo);
   assert.equal(res.status, 1);
   assert.match(res.stderr, /turn\.json inválido/i);
   assert.doesNotMatch(res.stderr, /^\s+at\s+/m, 'stderr não deve conter stack trace');
@@ -310,14 +373,14 @@ test('wait: ja e a vez de gemini sai 0 em menos de 1 s', () => {
     '--slug=teste-wait',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   // claude passa para gemini
-  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
 
   const start = Date.now();
-  const res = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  const res = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   const elapsed = Date.now() - start;
 
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
@@ -335,7 +398,7 @@ test('wait: vez do claude, pass para gemini acorda via wake sem caracteres proib
     '--slug=teste-wake',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   const geminiId = 'conv-123-gemini';
@@ -344,7 +407,7 @@ test('wait: vez do claude, pass para gemini acorda via wake sem caracteres proib
     'wait',
     '--for=gemini',
     `--wake=${geminiId}`,
-    `--repo=${repo}`
+    ...alvo(repo)
   ], {
     cwd: repo,
     env: {
@@ -357,7 +420,7 @@ test('wait: vez do claude, pass para gemini acorda via wake sem caracteres proib
   });
 
   await new Promise(r => setTimeout(r, 200));
-  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
 
   const code = await new Promise(resolve => waitProc.on('close', resolve));
 
@@ -380,13 +443,13 @@ test('wait: status terminal APPROVED sai 3', () => {
     '--slug=teste-term',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   // Leva a APPROVED
-  runCli(['pass', '--from=claude', '--to=human', '--action=done', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=human', '--action=done', ...alvo(repo)], repo);
 
-  const res = runCli(['wait', '--for=claude', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  const res = runCli(['wait', '--for=claude', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res.status, 3);
 });
 
@@ -400,7 +463,7 @@ test('wait: timeout-min rapido sai 2 e envia aviso de timeout', () => {
     '--slug=teste-timeout',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   // Vez do claude, esperamos por gemini com timeout de ~0.02 min (1.2 s)
@@ -409,7 +472,7 @@ test('wait: timeout-min rapido sai 2 e envia aviso de timeout', () => {
     '--for=gemini',
     '--timeout-min=0.02',
     '--wake=conv-timeout',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo, {
     BASTAO_POLL_MS: '50',
     BASTAO_AGENTAPI: scriptPath,
@@ -431,29 +494,29 @@ test('wait: lock concorrente sai 4, lock orfao ou antigo e assumido', () => {
     '--slug=teste-lock',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
-  const lockPath = path.join(repo, '.agents', 'wait-gemini.lock');
+  const lock = lockPath(repo, 'gemini');
 
   // 1. Simula lock ativo com PID atual e mtime recente
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
 
-  const res = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  const res = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res.status, 4, `Esperado 4 para lock ativo, obteve ${res.status}`);
 
   // 2. Lock com PID inexistente (999999) deve ser assumido
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, started_at: new Date().toISOString() }), 'utf8');
+  fs.writeFileSync(lock, JSON.stringify({ pid: 999999, started_at: new Date().toISOString() }), 'utf8');
   // Passa para gemini para sair 0
-  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
-  const res2 = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
+  const res2 = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res2.status, 0);
 
   // 3. Lock com PID vivo mas heartbeat antigo (> 30s) deve ser assumido
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
   const pastTime = new Date(Date.now() - 60000);
-  fs.utimesSync(lockPath, pastTime, pastTime);
-  const res3 = runCli(['wait', '--for=gemini', `--repo=${repo}`], repo, { BASTAO_POLL_MS: '50' });
+  fs.utimesSync(lock, pastTime, pastTime);
+  const res3 = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res3.status, 0);
 });
 
@@ -467,16 +530,16 @@ test('wait: falha no agentapi (FAKE_EXIT=1) sai 5 e grava wake_failed no history
     '--slug=teste-wake-fail',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
-  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
 
   const res = runCli([
     'wait',
     '--for=gemini',
     '--wake=conv-fail',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo, {
     BASTAO_POLL_MS: '50',
     BASTAO_AGENTAPI: scriptPath,
@@ -485,7 +548,7 @@ test('wait: falha no agentapi (FAKE_EXIT=1) sai 5 e grava wake_failed no history
 
   assert.equal(res.status, 5);
 
-  const turnPath = path.join(repo, '.agents', 'turn.json');
+  const turnPath = estadoPath(repo);
   const state = JSON.parse(fs.readFileSync(turnPath, 'utf8'));
   const lastHistory = state.history[state.history.length - 1];
   assert.equal(lastHistory.action, 'wake_failed');
@@ -540,7 +603,7 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
     '--slug=teste-codex',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   const notesComAcento = 'Ação com acentuação e aspas "ok"';
@@ -550,7 +613,7 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
     '--to=codex',
     '--action=implement',
     `--notes=${notesComAcento}`,
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo, {
     BASTAO_CODEX: scriptPath,
     BASTAO_CLI_PATH: BASTAO_CLI,
@@ -563,7 +626,7 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
   while (Date.now() - start < 5000) {
     await new Promise(r => setTimeout(r, 100));
     try {
-      state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+      state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
       if (state.conversations?.codex === 't-123') break;
     } catch {}
   }
@@ -584,7 +647,7 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
   assert.equal(state.status, 'WAITING_HUMAN');
   assert.equal(state.ask_human?.from, 'codex');
 
-  const liveLog = path.join(repo, '.agents', 'live', 'codex.log');
+  const liveLog = path.join(repo, '.agents', 'live', unicoCiclo(repo), 'codex.log');
   assert.ok(fs.existsSync(liveLog), 'Arquivo live/codex.log deve existir');
   const logContent = fs.readFileSync(liveLog, 'utf8');
   assert.ok(logContent.includes('ok ação'));
@@ -601,7 +664,7 @@ test('codex: com thread informada resume a thread', async () => {
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
     '--codex-thread=abc-thread',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   runCli([
@@ -609,7 +672,7 @@ test('codex: com thread informada resume a thread', async () => {
     '--from=claude',
     '--to=codex',
     '--action=implement',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo, {
     BASTAO_CODEX: scriptPath,
     BASTAO_CLI_PATH: BASTAO_CLI,
@@ -639,7 +702,7 @@ test('codex: FAKE_PASS=1 passa o bastao para claude', async () => {
     '--slug=teste-codex-pass',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   runCli([
@@ -647,7 +710,7 @@ test('codex: FAKE_PASS=1 passa o bastao para claude', async () => {
     '--from=claude',
     '--to=codex',
     '--action=implement',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo, {
     BASTAO_CODEX: scriptPath,
     BASTAO_CLI_PATH: BASTAO_CLI,
@@ -660,7 +723,7 @@ test('codex: FAKE_PASS=1 passa o bastao para claude', async () => {
   while (Date.now() - start < 5000) {
     await new Promise(r => setTimeout(r, 100));
     try {
-      state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+      state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
       if (state.current_turn === 'claude' && state.status === 'IN_PROGRESS') break;
     } catch {}
   }
@@ -679,7 +742,7 @@ test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
     '--slug=teste-codex-exit',
     '--spec=docs/spec.md',
     '--plan=docs/plan.md',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo);
 
   runCli([
@@ -687,7 +750,7 @@ test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
     '--from=claude',
     '--to=codex',
     '--action=implement',
-    `--repo=${repo}`
+    ...alvo(repo)
   ], repo, {
     BASTAO_CODEX: scriptPath,
     BASTAO_CLI_PATH: BASTAO_CLI,
@@ -700,7 +763,7 @@ test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
   while (Date.now() - start < 5000) {
     await new Promise(r => setTimeout(r, 100));
     try {
-      state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+      state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
       if (state.status === 'WAITING_HUMAN') break;
     } catch {}
   }
@@ -781,9 +844,9 @@ test('wait: agentapi .bat em pasta com espaço recebe id e texto como argumentos
   const bat = path.join(binDir, 'agentapi.bat');
   fs.writeFileSync(bat, '@echo off\r\n>"%~dp0args.log" echo %*\r\n', 'utf8');
 
-  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
-  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
-  const res = runCli(['wait', '--for=gemini', '--wake=conv-1', `--repo=${repo}`], repo, { BASTAO_AGENTAPI: bat });
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', ...alvo(repo)], repo);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
+  const res = runCli(['wait', '--for=gemini', '--wake=conv-1', ...alvo(repo)], repo, { BASTAO_AGENTAPI: bat });
 
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
   assert.equal(fs.readFileSync(logPath, 'utf8').trim(),
@@ -792,29 +855,29 @@ test('wait: agentapi .bat em pasta com espaço recebe id e texto como argumentos
 
 test('pass e wait recusam agente inválido, flag com typo, wake inválido e repo sem ciclo', () => {
   const repo = tempRepo();
-  assert.equal(runCli(['wait', '--for=gemini', `--repo=${repo}`], repo).status, 1, 'sem ciclo não fica pendurado');
-  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
-  const turnPath = path.join(repo, '.agents', 'turn.json');
+  assert.equal(runCli(['wait', '--for=gemini', ...alvo(repo)], repo).status, 1, 'sem ciclo não fica pendurado');
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', ...alvo(repo)], repo);
+  const turnPath = estadoPath(repo);
   const before = fs.readFileSync(turnPath);
-  assert.equal(runCli(['pass', '--from=claude', '--to=gemni', '--action=implement', `--repo=${repo}`], repo).status, 1);
-  const typo = runCli(['pass', '--from=claude', '--to=gemini', '--acton=implement', `--repo=${repo}`], repo);
+  assert.equal(runCli(['pass', '--from=claude', '--to=gemni', '--action=implement', ...alvo(repo)], repo).status, 1);
+  const typo = runCli(['pass', '--from=claude', '--to=gemini', '--acton=implement', ...alvo(repo)], repo);
   assert.equal(typo.status, 1);
   assert.doesNotMatch(typo.stderr, /^\s+at\s+/m, 'sem stack trace');
-  assert.equal(runCli(['wait', '--for=gemini', '--wake=a&b', `--repo=${repo}`], repo).status, 1);
+  assert.equal(runCli(['wait', '--for=gemini', '--wake=a&b', ...alvo(repo)], repo).status, 1);
   assert.deepEqual(fs.readFileSync(turnPath), before);
 });
 
 test('codex: binário inexistente vira WAITING_HUMAN em vez de travar', async () => {
   const repo = tempRepo();
-  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
-  runCli(['pass', '--from=claude', '--to=codex', '--action=implement', `--repo=${repo}`], repo,
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', ...alvo(repo)], repo);
+  runCli(['pass', '--from=claude', '--to=codex', '--action=implement', ...alvo(repo)], repo,
     { BASTAO_CODEX: path.join(ROOT, 'nao-existe.exe') });
 
   let state = null;
   const start = Date.now();
   while (Date.now() - start < 5000) {
     await new Promise(r => setTimeout(r, 100));
-    state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8'));
+    state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
     if (state.status === 'WAITING_HUMAN') break;
   }
   assert.equal(state.status, 'WAITING_HUMAN');
@@ -846,10 +909,10 @@ test('--help em subcomando mostra uso e pass repetido é no-op', () => {
   assert.equal(help.status, 0);
   assert.match(help.stdout, /init\s+--task=/);
 
-  runCli(['init', '--task=t', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
-  assert.equal(runCli(['pass', '--from=human', '--to=claude', '--action=plan', '--force', `--repo=${repo}`], repo).status, 0);
-  const again = runCli(['pass', '--from=human', '--to=claude', '--action=plan', `--repo=${repo}`], repo);
+  runCli(['init', '--task=t', '--spec=s', '--plan=p', ...alvo(repo)], repo);
+  assert.equal(runCli(['pass', '--from=human', '--to=claude', '--action=plan', '--force', ...alvo(repo)], repo).status, 0);
+  const again = runCli(['pass', '--from=human', '--to=claude', '--action=plan', ...alvo(repo)], repo);
   assert.equal(again.status, 0, `stderr: ${again.stderr}`);
   assert.match(again.stdout, /já está com claude/);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'turn.json'), 'utf8')).history.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8')).history.length, 1);
 });

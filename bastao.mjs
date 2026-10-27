@@ -3,14 +3,10 @@ import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+import { BastaoError } from './erro.mjs';
+import { SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, resolveCycle, addToIndex } from './ciclos.mjs';
 
-export class BastaoError extends Error {
-  constructor(message, code = 'GENERIC') {
-    super(message);
-    this.name = 'BastaoError';
-    this.code = code;
-  }
-}
+export { BastaoError };
 
 export const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -37,6 +33,10 @@ export function parseRoles(str) {
   return res;
 }
 
+export function slugify(task) {
+  return (task || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'ciclo';
+}
+
 export function initState({
   task,
   slug,
@@ -45,15 +45,18 @@ export function initState({
   implement = 'gemini',
   review = ['claude'],
   maxRounds = 3,
-  codexThread = null
+  codexThread = null,
+  worktree = null,
+  paradoMin = 15
 }, now = new Date().toISOString()) {
   const reviewList = Array.isArray(review) ? review : [review];
-  const stateSlug = slug || (task ? task.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : 'ciclo');
+  const stateSlug = slug || slugify(task);
   return {
-    version: 2,
+    version: 3,
     task,
     slug: stateSlug,
     branch: `ai/${stateSlug}`,
+    worktree,
     spec_file: spec,
     plan_file: plan,
     roles: {
@@ -69,11 +72,28 @@ export function initState({
     status: 'IN_PROGRESS',
     round: 1,
     max_rounds: Number(maxRounds) || 3,
+    seq: 0,
+    parado_min: Number(paradoMin) || 15,
+    wake: null,
+    stall: null,
     active_skills: ['ponytail', 'test-driven-development'],
     notes: '',
     last_evidence: null,
     ask_human: null,
     history: []
+  };
+}
+
+// Estado da versão 2 (turn.json legado) ganha os campos novos ao ser lido.
+export function normalizeState(s) {
+  return {
+    ...s,
+    version: 3,
+    worktree: s.worktree ?? null,
+    seq: s.seq ?? (s.history || []).length,
+    parado_min: s.parado_min ?? 15,
+    wake: s.wake ?? null,
+    stall: s.stall ?? null
   };
 }
 
@@ -226,30 +246,17 @@ export function formatInstructions(state) {
   ].join('\n');
 }
 
-export function resolveRepo(arg, cwd = process.cwd()) {
-  const targetDir = arg ? path.resolve(cwd, arg) : cwd;
-  const res = spawnSync('git', ['rev-parse', '--show-toplevel'], {
-    cwd: targetDir,
-    encoding: 'utf8'
-  });
-  if (res.status !== 0 || !res.stdout) {
-    throw new BastaoError('Diretório não é um repositório git', 'NOT_GIT');
-  }
-  return path.normalize(res.stdout.trim());
-}
-
-export async function readState(repo) {
-  const turnPath = path.join(repo, '.agents', 'turn.json');
-  if (!fs.existsSync(turnPath)) return null;
+export async function readState(file) {
+  if (!fs.existsSync(file)) return null;
 
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const raw = fs.readFileSync(turnPath, 'utf8');
-      return JSON.parse(raw);
+      const raw = fs.readFileSync(file, 'utf8');
+      return normalizeState(JSON.parse(raw));
     } catch (err) {
       if (err instanceof SyntaxError) {
-        throw new BastaoError(`turn.json inválido em ${turnPath}`, 'CORRUPT_STATE');
+        throw new BastaoError(`${path.basename(file)} inválido em ${file}`, 'CORRUPT_STATE');
       }
       lastErr = err;
       if (attempt < 3) await sleep(200);
@@ -258,14 +265,31 @@ export async function readState(repo) {
   throw lastErr;
 }
 
-export function writeState(repo, state) {
-  const agentsDir = path.join(repo, '.agents');
-  fs.mkdirSync(agentsDir, { recursive: true });
-  const tmpPath = path.join(agentsDir, 'turn.json.tmp');
-  const targetPath = path.join(agentsDir, 'turn.json');
-  const data = JSON.stringify(state, null, 2) + '\n';
-  fs.writeFileSync(tmpPath, data, 'utf8');
-  fs.renameSync(tmpPath, targetPath);
+export function writeState(file, state) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmpPath = file + '.tmp';
+  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  fs.renameSync(tmpPath, file);
+}
+
+// Cria .worktrees/<slug> na branch ai/<slug>; reaproveita a pasta ou a branch se já existirem.
+export function ensureWorktree(mainRepo, slug, base) {
+  const wt = path.join(mainRepo, '.worktrees', slug);
+  if (fs.existsSync(wt)) return wt;
+  const branch = `ai/${slug}`;
+  const list = spawnSync('git', ['worktree', 'list', '--porcelain'], { cwd: mainRepo, encoding: 'utf8' }).stdout || '';
+  const emUso = list.split(/\r?\n\r?\n/).find(b => b.split(/\r?\n/).includes(`branch refs/heads/${branch}`));
+  if (emUso) {
+    const onde = emUso.split(/\r?\n/)[0].replace(/^worktree /, '');
+    throw new BastaoError(`A branch ${branch} já está em uso em ${path.normalize(onde)}; troque de branch lá ou use outro --slug`, 'WORKTREE');
+  }
+  const exists = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: mainRepo }).status === 0;
+  const args = exists ? ['worktree', 'add', wt, branch] : ['worktree', 'add', '-b', branch, wt, base || 'HEAD'];
+  const res = spawnSync('git', args, { cwd: mainRepo, encoding: 'utf8' });
+  if (res.status !== 0) {
+    throw new BastaoError(`Não foi possível criar o worktree ${wt}: ${(res.stderr || res.stdout || '').trim()}`, 'WORKTREE');
+  }
+  return wt;
 }
 
 export function ensureExclude(repo) {
@@ -277,7 +301,9 @@ export function ensureExclude(repo) {
     '.agents/turn.json',
     '.agents/turn.json.tmp',
     '.agents/*.lock',
-    '.agents/live/'
+    '.agents/live/',
+    '.agents/ciclos/',
+    '.worktrees/'
   ];
   const existing = new Set(content.split(/\r?\n/).map(l => l.trim()));
   const missing = linesToAdd.filter(l => !existing.has(l));
@@ -483,17 +509,18 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     return;
   }
 
-  const repoArgIndex = rest.findIndex(a => a.startsWith('--repo=') || a === '--repo');
-  let repoPath = null;
-  if (repoArgIndex !== -1) {
-    if (rest[repoArgIndex].startsWith('--repo=')) {
-      repoPath = rest[repoArgIndex].slice('--repo='.length);
-    } else if (rest[repoArgIndex + 1]) {
-      repoPath = rest[repoArgIndex + 1];
-    }
-  }
+  const flag = name => {
+    const i = rest.findIndex(a => a === `--${name}` || a.startsWith(`--${name}=`));
+    if (i === -1) return null;
+    return rest[i].includes('=') ? rest[i].slice(name.length + 3) : rest[i + 1] || null;
+  };
 
-  const repo = resolveRepo(repoPath, process.cwd());
+  const repoArg = flag('repo');
+  const startDir = repoArg ? path.resolve(process.cwd(), repoArg) : process.cwd();
+  const mainRepo = mainRepoOf(startDir);
+  const toplevel = toplevelOf(startDir);
+  const repoName = path.basename(mainRepo);
+  const resolve = explicitRequired => resolveCycle({ mainRepo, toplevel, ciclo: flag('ciclo'), explicitRequired });
 
   if (command === 'init') {
     const { values } = parseArgs({
@@ -501,11 +528,14 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       options: {
         task: { type: 'string' },
         slug: { type: 'string' },
+        ciclo: { type: 'string' },
         spec: { type: 'string' },
         plan: { type: 'string' },
+        base: { type: 'string' },
         implement: { type: 'string', default: 'gemini' },
         review: { type: 'string', default: 'claude' },
         'max-rounds': { type: 'string', default: '3' },
+        'parado-min': { type: 'string', default: '15' },
         'codex-thread': { type: 'string' },
         force: { type: 'boolean', default: false },
         repo: { type: 'string' }
@@ -518,27 +548,48 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       throw new BastaoError('Comando init exige --task, --spec e --plan', 'INVALID_ARGS');
     }
 
-    const current = await readState(repo);
-    if (current && !values.force) {
-      throw new BastaoError('Já existe um ciclo ativo neste repositório. Use --force para sobrescrever.', 'ACTIVE_CYCLE');
+    const slug = values.slug || values.ciclo || slugify(values.task);
+    if (!SLUG_RE.test(slug)) {
+      throw new BastaoError(`Slug inválido "${slug}" (use letras minúsculas, números e hífen)`, 'INVALID_ARGS');
+    }
+    const paths = cyclePaths(mainRepo, slug, false);
+    if (fs.existsSync(paths.state) && !values.force) {
+      throw new BastaoError(`Já existe um ciclo "${slug}" neste repositório. Use --force para sobrescrever.`, 'ACTIVE_CYCLE');
     }
 
-    ensureExclude(repo);
+    const wt = ensureWorktree(mainRepo, slug, values.base);
+    ensureExclude(mainRepo);
 
     const reviewList = values.review ? values.review.split(',').map(s => s.trim()).filter(Boolean) : ['claude'];
     const state = initState({
       task: values.task,
-      slug: values.slug,
+      slug,
       spec: values.spec,
       plan: values.plan,
       implement: values.implement,
       review: reviewList,
       maxRounds: Number(values['max-rounds']) || 3,
-      codexThread: values['codex-thread'] || null
+      codexThread: values['codex-thread'] || null,
+      worktree: `.worktrees/${slug}`,
+      paradoMin: Number(values['parado-min']) || 15
     });
 
-    writeState(repo, state);
-    console.log(`bastao: ciclo iniciado para '${state.slug}' (vez de ${state.current_turn})`);
+    writeState(paths.state, state);
+    addToIndex(mainRepo, slug);
+    console.log(`bastao: ciclo '${slug}' iniciado (vez de ${state.current_turn})`);
+    console.log(`Worktree: ${wt}`);
+    console.log(`Antes de implementar, rode lá: npm install`);
+    for (const [label, rel] of [['Spec', values.spec], ['Plano', values.plan]]) {
+      if (!fs.existsSync(path.join(wt, rel))) {
+        console.log(`Aviso: ${label} ${rel} não existe no worktree; commite na base antes de passar o bastão.`);
+      }
+    }
+    const semIgnorar = fs.readdirSync(mainRepo)
+      .filter(f => /^(vitest|vite|eslint)\.config\.[cm]?[jt]s$|^tsconfig.*\.json$/.test(f))
+      .filter(f => !fs.readFileSync(path.join(mainRepo, f), 'utf8').includes('.worktrees'));
+    if (semIgnorar.length) {
+      console.log(`Aviso: ${semIgnorar.join(', ')} não ignora(m) .worktrees/; testes e lint da pasta principal vão ler os worktrees.`);
+    }
     return;
   }
 
@@ -554,17 +605,21 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
         skills: { type: 'string' },
         roles: { type: 'string' },
         force: { type: 'boolean', default: false },
-        repo: { type: 'string' }
+        repo: { type: 'string' },
+        ciclo: { type: 'string' }
       },
       allowPositionals: true,
       strict: true
     });
 
+    const cycle = resolve(false);
+    const file = cycle.paths.state;
+
     if (!values.from) throw new BastaoError('Comando pass exige --from', 'INVALID_ARGS');
     if (!values.to) throw new BastaoError('Comando pass exige --to', 'INVALID_ARGS');
     if (!values.action) throw new BastaoError('Comando pass exige --action', 'INVALID_ARGS');
 
-    const state = await readState(repo);
+    const state = await readState(file);
     if (!state) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
 
     // Repetir um pass que já foi aplicado não é erro: evita o "Não é a sua vez" que faz o agente tentar de novo.
@@ -585,13 +640,13 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       force: values.force || false
     });
 
-    writeState(repo, nextState);
+    writeState(file, nextState);
     if (notifyMsg) notify(notifyMsg);
     console.log(`bastao: bastão passado para ${nextState.current_turn} (${nextState.action})`);
 
     if (nextState.current_turn === 'codex' && nextState.status === 'IN_PROGRESS') {
       const bastaoScript = fileURLToPath(import.meta.url);
-      const child = spawn(process.execPath, [bastaoScript, '_codex', `--repo=${repo}`], {
+      const child = spawn(process.execPath, [bastaoScript, '_codex', `--repo=${mainRepo}`, `--ciclo=${cycle.slug}`], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
@@ -608,17 +663,21 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       options: {
         from: { type: 'string' },
         question: { type: 'string' },
-        repo: { type: 'string' }
+        repo: { type: 'string' },
+        ciclo: { type: 'string' }
       },
       allowPositionals: true,
       strict: true
     });
 
+    const cycle = resolve(false);
+    const file = cycle.paths.state;
+
     if (!values.from || !values.question) {
       throw new BastaoError('Comando ask exige --from e --question', 'INVALID_ARGS');
     }
 
-    const state = await readState(repo);
+    const state = await readState(file);
     if (!state) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
 
     const { state: nextState, notify: notifyMsg } = applyAsk(state, {
@@ -626,28 +685,33 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       question: values.question
     });
 
-    writeState(repo, nextState);
+    writeState(file, nextState);
     if (notifyMsg) notify(notifyMsg);
     console.log(`bastao: dúvida registrada. Aguardando resposta humana.`);
     return;
   }
 
   if (command === 'pause') {
-    const state = await readState(repo);
+    const file = resolve(false).paths.state;
+    const state = await readState(file);
     if (!state) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
 
     const { state: nextState } = applyPause(state);
-    writeState(repo, nextState);
+    writeState(file, nextState);
     console.log('bastao: ciclo pausado manualmente (vez de human)');
     return;
   }
 
   if (command === 'status') {
-    const state = await readState(repo);
-    if (!state) {
+    let cycle;
+    try {
+      cycle = resolve(false);
+    } catch (err) {
+      if (err.code !== 'NO_CYCLE' || flag('ciclo')) throw err;
       console.log('bastao: nenhum ciclo ativo');
       return;
     }
+    const state = await readState(cycle.paths.state);
 
     console.log(formatInstructions(state));
     console.log('\nHistórico recente:');
@@ -669,11 +733,15 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
         for: { type: 'string' },
         wake: { type: 'string' },
         'timeout-min': { type: 'string', default: '240' },
-        repo: { type: 'string' }
+        repo: { type: 'string' },
+        ciclo: { type: 'string' }
       },
       allowPositionals: true,
       strict: true
     });
+
+    const cycle = resolve(false);
+    const file = cycle.paths.state;
 
     if (!values.for) {
       throw new BastaoError('Comando wait exige --for=<agente>', 'INVALID_ARGS');
@@ -686,8 +754,9 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     if (values.wake && !/^[\w-]+$/.test(values.wake)) {
       throw new BastaoError(`--wake inválido: ${values.wake} (use o Conversation ID)`, 'INVALID_ARGS');
     }
-    if (!(await readState(repo))) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
-    const lockPath = path.join(repo, '.agents', `wait-${forAgent}.lock`);
+    if (!(await readState(file))) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
+    const lockPath = cycle.paths.lock(forAgent);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
 
     if (isLockAlive(lockPath)) {
       console.error(`bastao: já existe vigia ativo para ${forAgent}`);
@@ -707,12 +776,12 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     try {
       const wakeId = values.wake;
       if (wakeId) {
-        const state = await readState(repo);
+        const state = await readState(file);
         if (state) {
           state.conversations = state.conversations || {};
           if (state.conversations.gemini !== wakeId) {
             state.conversations.gemini = wakeId;
-            writeState(repo, state);
+            writeState(file, state);
           }
         }
       }
@@ -727,7 +796,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
           fs.utimesSync(lockPath, new Date(), new Date());
         } catch {}
 
-        const state = await readState(repo);
+        const state = await readState(file);
 
         if (state && ['APPROVED', 'MAX_ROUNDS_REACHED', 'MANUAL_PAUSE'].includes(state.status)) {
           if (wakeId) {
@@ -752,7 +821,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
                 notes: `Falha ao acordar ${forAgent}`,
                 evidence: null
               });
-              writeState(repo, state);
+              writeState(file, state);
               notify(`[FALHA] Falha ao acordar ${forAgent}`);
               cleanLock();
               process.exit(5);
@@ -780,12 +849,14 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
   }
 
   if (command === '_codex') {
-    const state = await readState(repo);
+    const cycle = resolve(false);
+    const file = cycle.paths.state;
+    const state = await readState(file);
     if (!state || state.current_turn !== 'codex' || state.status !== 'IN_PROGRESS') {
       return;
     }
 
-    let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', repo];
+    let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', mainRepo];
     if (state.conversations?.codex) {
       codexArgs.push('resume', state.conversations.codex);
     }
@@ -793,7 +864,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
 
     const prompt = `${formatInstructions(state)}\n\nVocê é o Codex no Protocolo do Bastão. Siga a skill bastao. Termine SEMPRE com: bastao pass --from=codex …`;
 
-    const liveDir = path.join(repo, '.agents', 'live');
+    const liveDir = cycle.paths.liveDir;
     fs.mkdirSync(liveDir, { recursive: true });
     const logPath = path.join(liveDir, 'codex.log');
 
@@ -812,7 +883,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
 
       const child = spawn(execCmd, finalArgs, {
-        cwd: repo,
+        cwd: mainRepo,
         windowsHide: true,
         env: process.env
       });
@@ -843,23 +914,23 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       const m = fullOutput.match(/session id:\s*([a-zA-Z0-9_-]+)/i);
       if (m) {
         const sessId = m[1];
-        const cur = await readState(repo);
+        const cur = await readState(file);
         if (cur) {
           cur.conversations = cur.conversations || {};
           cur.conversations.codex = sessId;
-          writeState(repo, cur);
+          writeState(file, cur);
         }
       }
     }
 
-    const latest = await readState(repo);
+    const latest = await readState(file);
     if (latest && latest.current_turn === 'codex' && latest.status === 'IN_PROGRESS') {
-      const question = `Codex terminou sem passar o bastão (exit ${exitCode ?? 0}). Veja .agents/live/codex.log`;
+      const question = `Codex terminou sem passar o bastão (exit ${exitCode ?? 0}). Veja ${path.relative(mainRepo, logPath)}`;
       const { state: nextState, notify: notifyMsg } = applyAsk(latest, {
         from: 'codex',
         question
       });
-      writeState(repo, nextState);
+      writeState(file, nextState);
       if (notifyMsg) notify(notifyMsg);
     }
     return;

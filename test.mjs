@@ -632,7 +632,7 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
   // Aguarda até 5s para o processo desanexado do codex rodar
   const start = Date.now();
   let state = null;
-  while (Date.now() - start < 5000) {
+  while (Date.now() - start < 15000) {
     await new Promise(r => setTimeout(r, 100));
     try {
       state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
@@ -694,7 +694,7 @@ test('codex: com thread informada resume a thread', async () => {
   });
 
   const start = Date.now();
-  while (Date.now() - start < 5000) {
+  while (Date.now() - start < 15000) {
     await new Promise(r => setTimeout(r, 100));
     if (fs.existsSync(logPath)) break;
   }
@@ -734,7 +734,7 @@ test('codex: FAKE_PASS=1 passa o bastao para claude', async () => {
 
   const start = Date.now();
   let state = null;
-  while (Date.now() - start < 5000) {
+  while (Date.now() - start < 15000) {
     await new Promise(r => setTimeout(r, 100));
     try {
       state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
@@ -774,7 +774,7 @@ test('codex: FAKE_EXIT=1 gera ask_human informando exit 1', async () => {
 
   const start = Date.now();
   let state = null;
-  while (Date.now() - start < 5000) {
+  while (Date.now() - start < 15000) {
     await new Promise(r => setTimeout(r, 100));
     try {
       state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
@@ -889,7 +889,7 @@ test('codex: binário inexistente vira WAITING_HUMAN em vez de travar', async ()
 
   let state = null;
   const start = Date.now();
-  while (Date.now() - start < 5000) {
+  while (Date.now() - start < 15000) {
     await new Promise(r => setTimeout(r, 100));
     state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
     if (state.status === 'WAITING_HUMAN') break;

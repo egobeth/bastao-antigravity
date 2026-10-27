@@ -4,7 +4,10 @@ import { spawnSync, spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { BastaoError } from './erro.mjs';
-import { SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, listCycles, resolveCycle, addToIndex } from './ciclos.mjs';
+import {
+  SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, listCycles, resolveCycle,
+  indexPath, readIndex, addToIndex, removeFromIndex
+} from './ciclos.mjs';
 import { lastActivity, decideStall, isParado } from './parada.mjs';
 
 export { BastaoError };
@@ -417,6 +420,49 @@ export function findCodex() {
   throw new BastaoError('Codex não encontrado', 'CODEX_NOT_FOUND');
 }
 
+const atividadeDe = (state, paths, mainRepo) =>
+  lastActivity({ dir: paths.worktree || mainRepo, branch: state.branch, state });
+
+// Há quanto tempo o dono está com o bastão, vigias vivos, se dá para acordá-lo e se está PARADO.
+// Sem vigia vivo, a parada é calculada na hora (só para exibir).
+export function situacaoDe(state, paths, mainRepo) {
+  const vivos = ['claude', 'gemini', 'codex'].filter(a => isLockAlive(paths.lock(a)));
+  const dono = state.current_turn;
+  const acordavel = dono === 'gemini' ? !!state.conversations?.gemini
+    : dono === 'claude' ? vivos.includes('claude')
+      : dono === 'codex';
+  const idle = Date.now() - atividadeDe(state, paths, mainRepo);
+  const parado = isParado(state)
+    || (vivos.length === 0 && state.status === 'IN_PROGRESS' && dono !== 'human' && idle >= state.parado_min * 60000);
+  return { minutos: Math.round(idle / 60000), vivos, acordavel, parado };
+}
+
+// Uma linha por ciclo de todos os repositórios do índice; entradas cujo estado sumiu saem do índice.
+async function statusTodos() {
+  const { ciclos, corrupt } = readIndex();
+  if (corrupt) console.log(`Aviso: índice ${indexPath()} ilegível; ele será refeito pelos próximos init.`);
+  if (ciclos.length === 0) console.log('bastao: nenhum ciclo registrado');
+  for (const { repo, slug } of ciclos) {
+    const found = fs.existsSync(repo) ? listCycles(repo).find(c => c.slug === slug) : null;
+    if (!found) {
+      removeFromIndex(repo, slug);
+      continue;
+    }
+    const paths = cyclePaths(repo, slug, found.legacy);
+    let state;
+    try {
+      state = await readState(paths.state);
+    } catch (err) {
+      console.log(`${path.basename(repo)}/${slug} · ${err.message}`);
+      continue;
+    }
+    const s = situacaoDe(state, paths, repo);
+    console.log(`${path.basename(repo)}/${slug} · vez de ${state.current_turn} (${state.action}) há ${s.minutos} min`
+      + ` · vigias: ${s.vivos.join(', ') || 'nenhum'} · acordável: ${s.acordavel ? 'sim' : 'não'}${s.parado ? ' · PARADO' : ''}`);
+    console.log(`  ${paths.worktree || repo}`);
+  }
+}
+
 export function notify(text) {
   const dest = process.env.BASTAO_NOTIFY;
   if (dest === 'off') return;
@@ -442,14 +488,16 @@ export async function main() {
 
   if (!command || ['--help', '-h', 'help'].includes(command) || rest.includes('--help') || rest.includes('-h')) {
     console.log(`Uso: bastao <comando> [opções]
-  status
-  init    --task= --spec= --plan= [--slug=] [--implement=gemini] [--review=claude,codex] [--max-rounds=3] [--codex-thread=] [--force]
-  pass    --from= --to= --action= [--notes=] [--evidence=] [--skills=a,b] [--roles=implement:x,review:y+z] [--force]
+  status  [--todos]
+  init    --task= --spec= --plan= [--slug=] [--base=HEAD] [--implement=gemini] [--review=claude,codex] [--max-rounds=3] [--parado-min=15] [--codex-thread=] [--force]
+  pass    --from= --to= --action= [--notes=] [--evidence=] [--skills=a,b] [--roles=implement:x,review:y+z] [--parado-min=] [--force]
   ask     --from= --question=
   pause
-  wait    --for=<claude|gemini|codex> [--wake=<id>] [--timeout-min=240]
+  wait    --for=<claude|gemini|codex> [--wake=<id>, obrigatório para gemini] [--timeout-min=240]
+  fim     (só com ok do usuário: remove o worktree limpo e encerra o ciclo; a branch fica)
   install [--yes]
-Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'.`);
+Todos aceitam --repo=<dir> e --ciclo=<slug>. Dentro de .worktrees/<slug> o ciclo é deduzido; na pasta
+principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'pass', não 'init'.`);
     return;
   }
 
@@ -556,16 +604,26 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     return rest[i].includes('=') ? rest[i].slice(name.length + 3) : rest[i + 1] || null;
   };
 
+  if (command === 'status' && rest.includes('--todos')) {
+    await statusTodos();
+    return;
+  }
+
   const repoArg = flag('repo');
   const startDir = repoArg ? path.resolve(process.cwd(), repoArg) : process.cwd();
   const mainRepo = mainRepoOf(startDir);
   const toplevel = toplevelOf(startDir);
   const repoName = path.basename(mainRepo);
-  const resolve = explicitRequired => resolveCycle({ mainRepo, toplevel, ciclo: flag('ciclo'), explicitRequired });
+  const resolve = explicitRequired => {
+    const cycle = resolveCycle({ mainRepo, toplevel, ciclo: flag('ciclo'), explicitRequired });
+    // Ciclos legados não passaram pelo init novo: entram no índice quando usados.
+    if (cycle.legacy) addToIndex(mainRepo, cycle.slug);
+    return cycle;
+  };
   const instr = (state, cycle) => formatInstructions(state, { repoName, worktreeAbs: cycle.paths.worktree });
   // Toda notificação vira '[TAG] <repo>/<slug> ...'.
   const avisar = msg => notify(msg.replace(/^(\[[^\]]+\]) /, `$1 ${repoName}/`));
-  const atividade = (state, cycle) => lastActivity({ dir: cycle.paths.worktree || mainRepo, branch: state.branch, state });
+  const atividade = (state, cycle) => atividadeDe(state, cycle.paths, mainRepo);
 
   // Rodado pelos vigias: reacorda o Gemini parado uma vez e, persistindo, avisa o usuário (uma vez por parada).
   const checarParada = async cycle => {
@@ -588,21 +646,13 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     }
   };
 
-  // Linhas de situação do status: há quanto tempo, vigias, se dá para acordar o dono e PARADO.
   const situacao = (state, cycle) => {
-    const vivos = ['claude', 'gemini', 'codex'].filter(a => isLockAlive(cycle.paths.lock(a)));
-    const dono = state.current_turn;
-    const acordavel = dono === 'gemini' ? !!state.conversations?.gemini
-      : dono === 'claude' ? vivos.includes('claude')
-        : dono === 'codex';
-    const activityMs = atividade(state, cycle);
-    const parado = isParado(state)
-      || (vivos.length === 0 && state.status === 'IN_PROGRESS' && dono !== 'human' && Date.now() - activityMs >= state.parado_min * 60000);
+    const s = situacaoDe(state, cycle.paths, mainRepo);
     return [
-      `Com ${dono} há ${Math.round((Date.now() - activityMs) / 60000)} min`,
-      `Vigias: ${vivos.join(', ') || 'nenhum'}`,
-      `Acordável: ${acordavel ? 'sim' : 'não'}`,
-      ...(parado ? ['PARADO: sem atividade além do limite; veja o dono do bastão'] : [])
+      `Com ${state.current_turn} há ${s.minutos} min`,
+      `Vigias: ${s.vivos.join(', ') || 'nenhum'}`,
+      `Acordável: ${s.acordavel ? 'sim' : 'não'}`,
+      ...(s.parado ? ['PARADO: sem atividade além do limite; veja o dono do bastão'] : [])
     ];
   };
 
@@ -952,6 +1002,28 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     } finally {
       cleanLock();
     }
+  }
+
+  if (command === 'fim') {
+    parseArgs({ args: rest, options: { repo: { type: 'string' }, ciclo: { type: 'string' } }, allowPositionals: true, strict: true });
+    const cycle = resolve(true);
+    const vivos = ['claude', 'gemini', 'codex'].filter(a => isLockAlive(cycle.paths.lock(a)));
+    if (vivos.length) {
+      throw new BastaoError(`Há vigia ativo neste ciclo (${vivos.join(', ')}); encerre-o antes de rodar fim`, 'ACTIVE_WATCHER');
+    }
+    const wt = cycle.paths.worktree;
+    if (wt && fs.existsSync(wt)) {
+      const sujo = spawnSync('git', ['status', '--porcelain'], { cwd: wt, encoding: 'utf8' }).stdout.trim();
+      if (sujo) throw new BastaoError(`O worktree ${wt} tem alterações não commitadas:\n${sujo}`, 'DIRTY_WORKTREE');
+      const res = spawnSync('git', ['worktree', 'remove', wt], { cwd: mainRepo, encoding: 'utf8' });
+      if (res.status !== 0) {
+        throw new BastaoError(`Não foi possível remover o worktree ${wt}: ${(res.stderr || res.stdout || '').trim()}`, 'WORKTREE');
+      }
+    }
+    fs.rmSync(cycle.paths.state, { force: true });
+    removeFromIndex(mainRepo, cycle.slug);
+    console.log(`bastao: ciclo '${cycle.slug}' encerrado${wt ? '; worktree removido' : ''}; a branch ai/${cycle.slug} foi mantida`);
+    return;
   }
 
   if (command === '_codex') {

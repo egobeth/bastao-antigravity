@@ -1114,3 +1114,91 @@ test('pass aceita --parado-min e grava no estado', () => {
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
   assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'pm.json'), 'utf8')).parado_min, 40);
 });
+
+// --- Multiciclo: status --todos e fim ---
+
+test('status --todos lista ciclos de dois repos e poda entrada órfã', () => {
+  const indice = path.join(ROOT, `indice-todos-${Date.now()}.json`);
+  const env = { BASTAO_INDEX: indice };
+  const r1 = tempRepo();
+  const r2 = tempRepo();
+  runCli(['init', '--task=um', '--slug=um', '--spec=s', '--plan=p', `--repo=${r1}`], r1, env);
+  runCli(['init', '--task=dois', '--slug=dois', '--spec=s', '--plan=p', `--repo=${r2}`], r2, env);
+  const idx = JSON.parse(fs.readFileSync(indice, 'utf8'));
+  idx.ciclos.push({ repo: path.join(ROOT, 'nao-existe-mais'), slug: 'fantasma', criado_em: new Date().toISOString() });
+  fs.writeFileSync(indice, JSON.stringify(idx));
+
+  const res = runCli(['status', '--todos'], ROOT, env);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.match(res.stdout, /pasta com espaço é\/um · vez de claude \(spec\) há \d+ min · vigias: nenhum · acordável: não/);
+  assert.match(res.stdout, /pasta com espaço é\/dois · vez de claude/);
+  assert.ok(res.stdout.includes(path.join(r1, '.worktrees', 'um')));
+  assert.doesNotMatch(res.stdout, /fantasma/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(indice, 'utf8')).ciclos.map(c => c.slug), ['um', 'dois']);
+});
+
+test('status --todos com índice corrompido avisa e não quebra', () => {
+  const indice = path.join(ROOT, `indice-ruim-${Date.now()}.json`);
+  fs.writeFileSync(indice, '{quebrado');
+  const res = runCli(['status', '--todos'], ROOT, { BASTAO_INDEX: indice });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(res.stdout.includes(indice));
+});
+
+test('ciclo legado entra no índice ao ser usado', () => {
+  const indice = path.join(ROOT, `indice-leg-${Date.now()}.json`);
+  const repo = tempRepo();
+  fs.mkdirSync(path.join(repo, '.agents'));
+  fs.writeFileSync(path.join(repo, '.agents', 'turn.json'), JSON.stringify({
+    version: 2, slug: 'leg', branch: 'ai/leg', current_turn: 'claude', action: 'spec', status: 'IN_PROGRESS',
+    round: 1, max_rounds: 3, history: []
+  }));
+  runCli(['status', `--repo=${repo}`], repo, { BASTAO_INDEX: indice });
+  const res = runCli(['status', '--todos'], ROOT, { BASTAO_INDEX: indice });
+  assert.match(res.stdout, /pasta com espaço é\/leg · vez de claude/);
+});
+
+test('fim recusa worktree com alteração não commitada', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=f', '--slug=sujo', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const wt = path.join(repo, '.worktrees', 'sujo');
+  fs.writeFileSync(path.join(wt, 'novo.txt'), 'x');
+  const res = runCli(['fim', `--repo=${repo}`, '--ciclo=sujo'], repo);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /não commitad/);
+  assert.ok(fs.existsSync(path.join(wt, 'novo.txt')));
+  assert.ok(fs.existsSync(path.join(repo, '.agents', 'ciclos', 'sujo.json')));
+});
+
+test('fim recusa com vigia vivo', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=f', '--slug=vivo', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  fs.writeFileSync(path.join(repo, '.agents', 'ciclos', 'vivo.wait-claude.lock'), JSON.stringify({ pid: process.pid }));
+  const res = runCli(['fim', `--repo=${repo}`, '--ciclo=vivo'], repo);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /vigia/);
+  assert.ok(fs.existsSync(path.join(repo, '.worktrees', 'vivo')));
+});
+
+test('fim remove worktree limpo, estado e entrada do índice, mantendo a branch', () => {
+  const indice = path.join(ROOT, `indice-fim-${Date.now()}.json`);
+  const env = { BASTAO_INDEX: indice };
+  const repo = tempRepo();
+  runCli(['init', '--task=f', '--slug=limpo', '--spec=s', '--plan=p', `--repo=${repo}`], repo, env);
+  const res = runCli(['fim', `--repo=${repo}`, '--ciclo=limpo'], repo, env);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(!fs.existsSync(path.join(repo, '.worktrees', 'limpo')));
+  assert.ok(!fs.existsSync(path.join(repo, '.agents', 'ciclos', 'limpo.json')));
+  assert.deepEqual(JSON.parse(fs.readFileSync(indice, 'utf8')).ciclos, []);
+  assert.equal(git(repo, 'branch', '--list', 'ai/limpo').stdout.trim(), 'ai/limpo');
+});
+
+test('fim no legado apaga turn.json', () => {
+  const repo = tempRepo();
+  fs.mkdirSync(path.join(repo, '.agents'));
+  const turn = path.join(repo, '.agents', 'turn.json');
+  fs.writeFileSync(turn, JSON.stringify({ version: 2, slug: 'leg', status: 'APPROVED', current_turn: 'human', history: [] }));
+  const res = runCli(['fim', `--repo=${repo}`], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(!fs.existsSync(turn));
+});

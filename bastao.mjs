@@ -4,7 +4,7 @@ import { spawnSync, spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { BastaoError } from './erro.mjs';
-import { SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, resolveCycle, addToIndex } from './ciclos.mjs';
+import { SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, listCycles, resolveCycle, addToIndex } from './ciclos.mjs';
 
 export { BastaoError };
 
@@ -152,6 +152,7 @@ export function applyPass(state, {
   }
 
   const s = JSON.parse(JSON.stringify(state));
+  s.seq = (state.seq ?? 0) + 1;
   s.current_turn = newTurn;
   s.status = newStatus;
   s.round = newRound;
@@ -196,6 +197,7 @@ export function applyAsk(state, { from, question }, now = new Date().toISOString
   }
 
   const s = JSON.parse(JSON.stringify(state));
+  s.seq = (state.seq ?? 0) + 1;
   s.status = 'WAITING_HUMAN';
   s.ask_human = { from, question, at: now };
   s.history.push({
@@ -208,12 +210,13 @@ export function applyAsk(state, { from, question }, now = new Date().toISOString
     evidence: null
   });
 
-  const notify = `[DÚVIDA] ${from}: ${question}`;
+  const notify = `[DÚVIDA] ${s.slug} · ${from}: ${question}`;
   return { state: s, notify };
 }
 
 export function applyPause(state, now = new Date().toISOString()) {
   const s = JSON.parse(JSON.stringify(state));
+  s.seq = (state.seq ?? 0) + 1;
   s.status = 'MANUAL_PAUSE';
   s.current_turn = 'human';
   s.history.push({
@@ -228,11 +231,13 @@ export function applyPause(state, now = new Date().toISOString()) {
   return { state: s, notify: null };
 }
 
-export function formatInstructions(state) {
+export function formatInstructions(state, { repoName = null, worktreeAbs = null } = {}) {
   const rolesStr = state.roles
     ? `implement:${state.roles.implement}, review:${(state.roles.review || []).join('+')}`
     : '';
   return [
+    ...(repoName ? [`Ciclo: ${state.slug} (${repoName})`] : []),
+    ...(worktreeAbs ? [`Workspace: ${worktreeAbs}`] : []),
     `Vez de: ${state.current_turn}`,
     `Ação: ${state.action}`,
     `Round: ${state.round}/${state.max_rounds}`,
@@ -242,7 +247,7 @@ export function formatInstructions(state) {
     `Última evidência: ${state.last_evidence || '(nenhuma)'}`,
     `Skills: ${(state.active_skills || []).join(', ')}`,
     `Papéis: ${rolesStr}`,
-    `Ao terminar: bastao pass --from=${state.current_turn} …`
+    `Ao terminar: bastao pass --from=${state.current_turn} --ciclo=${state.slug} …`
   ].join('\n');
 }
 
@@ -521,6 +526,9 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
   const toplevel = toplevelOf(startDir);
   const repoName = path.basename(mainRepo);
   const resolve = explicitRequired => resolveCycle({ mainRepo, toplevel, ciclo: flag('ciclo'), explicitRequired });
+  const instr = (state, cycle) => formatInstructions(state, { repoName, worktreeAbs: cycle.paths.worktree });
+  // Toda notificação vira '[TAG] <repo>/<slug> ...'.
+  const avisar = msg => notify(msg.replace(/^([[^]]+]) /, `$1 ${repoName}/`));
 
   if (command === 'init') {
     const { values } = parseArgs({
@@ -612,7 +620,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       strict: true
     });
 
-    const cycle = resolve(false);
+    const cycle = resolve(true);
     const file = cycle.paths.state;
 
     if (!values.from) throw new BastaoError('Comando pass exige --from', 'INVALID_ARGS');
@@ -641,7 +649,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     });
 
     writeState(file, nextState);
-    if (notifyMsg) notify(notifyMsg);
+    if (notifyMsg) avisar(notifyMsg);
     console.log(`bastao: bastão passado para ${nextState.current_turn} (${nextState.action})`);
 
     if (nextState.current_turn === 'codex' && nextState.status === 'IN_PROGRESS') {
@@ -670,7 +678,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       strict: true
     });
 
-    const cycle = resolve(false);
+    const cycle = resolve(true);
     const file = cycle.paths.state;
 
     if (!values.from || !values.question) {
@@ -686,7 +694,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     });
 
     writeState(file, nextState);
-    if (notifyMsg) notify(notifyMsg);
+    if (notifyMsg) avisar(notifyMsg);
     console.log(`bastao: dúvida registrada. Aguardando resposta humana.`);
     return;
   }
@@ -707,13 +715,21 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     try {
       cycle = resolve(false);
     } catch (err) {
+      if (err.code === 'AMBIGUOUS_CYCLE') {
+        for (const c of listCycles(mainRepo)) {
+          const st = await readState(cyclePaths(mainRepo, c.slug, c.legacy).state);
+          console.log(`${c.slug} · vez de ${st.current_turn} · ${st.action} · ${st.status}`);
+        }
+        console.log('Indique o ciclo com --ciclo=<slug>.');
+        return;
+      }
       if (err.code !== 'NO_CYCLE' || flag('ciclo')) throw err;
       console.log('bastao: nenhum ciclo ativo');
       return;
     }
     const state = await readState(cycle.paths.state);
 
-    console.log(formatInstructions(state));
+    console.log(instr(state, cycle));
     console.log('\nHistórico recente:');
     const recent = (state.history || []).slice(-5);
     if (recent.length === 0) {
@@ -740,7 +756,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       strict: true
     });
 
-    const cycle = resolve(false);
+    const cycle = resolve(true);
     const file = cycle.paths.state;
 
     if (!values.for) {
@@ -822,12 +838,12 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
                 evidence: null
               });
               writeState(file, state);
-              notify(`[FALHA] Falha ao acordar ${forAgent}`);
+              avisar(`[FALHA] ${state.slug}: falha ao acordar ${forAgent}`);
               cleanLock();
               process.exit(5);
             }
           }
-          console.log(formatInstructions(state));
+          console.log(instr(state, cycle));
           cleanLock();
           process.exit(0);
         }
@@ -850,19 +866,20 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
 
   if (command === '_codex') {
     const cycle = resolve(false);
+    const workDir = cycle.paths.worktree || mainRepo;
     const file = cycle.paths.state;
     const state = await readState(file);
     if (!state || state.current_turn !== 'codex' || state.status !== 'IN_PROGRESS') {
       return;
     }
 
-    let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', mainRepo];
+    let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', workDir];
     if (state.conversations?.codex) {
       codexArgs.push('resume', state.conversations.codex);
     }
     codexArgs.push('-');
 
-    const prompt = `${formatInstructions(state)}\n\nVocê é o Codex no Protocolo do Bastão. Siga a skill bastao. Termine SEMPRE com: bastao pass --from=codex …`;
+    const prompt = `${instr(state, cycle)}\n\nVocê é o Codex no Protocolo do Bastão. Siga a skill bastao. Termine SEMPRE com: bastao pass --from=codex …`;
 
     const liveDir = cycle.paths.liveDir;
     fs.mkdirSync(liveDir, { recursive: true });
@@ -883,7 +900,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
 
       const child = spawn(execCmd, finalArgs, {
-        cwd: mainRepo,
+        cwd: workDir,
         windowsHide: true,
         env: process.env
       });
@@ -931,7 +948,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
         question
       });
       writeState(file, nextState);
-      if (notifyMsg) notify(notifyMsg);
+      if (notifyMsg) avisar(notifyMsg);
     }
     return;
   }

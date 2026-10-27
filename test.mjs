@@ -639,6 +639,7 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
   assert.ok(fakeData.argv.includes('--sandbox'));
   assert.ok(fakeData.argv.includes('workspace-write'));
   assert.ok(fakeData.argv.includes('-C'));
+  assert.equal(fakeData.argv[fakeData.argv.indexOf('-C') + 1], path.join(repo, '.worktrees', 'teste-codex'), 'codex roda no worktree');
   assert.ok(fakeData.argv.includes('-'));
   assert.ok(fakeData.stdin.includes('Vez de: codex'));
   assert.ok(fakeData.stdin.includes(notesComAcento));
@@ -915,4 +916,82 @@ test('--help em subcomando mostra uso e pass repetido é no-op', () => {
   assert.equal(again.status, 0, `stderr: ${again.stderr}`);
   assert.match(again.stdout, /já está com claude/);
   assert.equal(JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8')).history.length, 1);
+});
+
+// --- Multiciclo: comandos no ciclo resolvido ---
+
+function doisCiclos() {
+  const repo = tempRepo();
+  for (const slug of ['a', 'b']) {
+    const res = runCli(['init', `--task=${slug}`, `--slug=${slug}`, '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+    assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  }
+  const estado = slug => path.join(repo, '.agents', 'ciclos', `${slug}.json`);
+  return { repo, estado };
+}
+
+test('pass em um ciclo não altera o outro e incrementa seq', () => {
+  const { repo, estado } = doisCiclos();
+  const antesB = fs.readFileSync(estado('b'));
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=a'], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const a = JSON.parse(fs.readFileSync(estado('a'), 'utf8'));
+  assert.equal(a.current_turn, 'gemini');
+  assert.equal(a.seq, 1);
+  assert.deepEqual(fs.readFileSync(estado('b')), antesB);
+});
+
+test('comando dentro do worktree infere o ciclo sem --ciclo e status mostra ciclo e workspace', () => {
+  const { repo, estado } = doisCiclos();
+  const sub = path.join(repo, '.worktrees', 'b', 'sub');
+  fs.mkdirSync(sub);
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement'], sub);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(estado('b'), 'utf8')).current_turn, 'gemini');
+  assert.equal(JSON.parse(fs.readFileSync(estado('a'), 'utf8')).current_turn, 'claude');
+  const st = runCli(['status'], sub);
+  assert.equal(st.status, 0, `stderr: ${st.stderr}`);
+  assert.match(st.stdout, /Ciclo: b \(pasta com espaço é\)/);
+  assert.ok(st.stdout.includes(`Workspace: ${path.join(repo, '.worktrees', 'b')}`));
+});
+
+test('na pasta principal pass e wait exigem --ciclo; status lista os ciclos', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=a', '--slug=a', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const pass = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`], repo);
+  assert.equal(pass.status, 1);
+  assert.match(pass.stderr, /--ciclo=a/);
+  assert.match(pass.stderr, /\.worktrees/);
+  const wait = runCli(['wait', '--for=claude', '--timeout-min=0.001', `--repo=${repo}`], repo);
+  assert.equal(wait.status, 1);
+  assert.match(wait.stderr, /--ciclo=a/);
+
+  runCli(['init', '--task=b', '--slug=b', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const st = runCli(['status', `--repo=${repo}`], repo);
+  assert.equal(st.status, 0, `stderr: ${st.stderr}`);
+  assert.match(st.stdout, /^a · vez de claude · spec · IN_PROGRESS/m);
+  assert.match(st.stdout, /^b · vez de claude · spec · IN_PROGRESS/m);
+});
+
+test('legado: turn.json segue funcionando com lock antigo ao lado de um ciclo novo', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=novo', '--slug=novo', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const turn = path.join(repo, '.agents', 'turn.json');
+  fs.writeFileSync(turn, JSON.stringify({
+    version: 2, task: 'leg', slug: 'leg', branch: 'ai/leg', spec_file: 's', plan_file: 'p',
+    roles: { implement: 'gemini', review: ['claude'] }, conversations: { gemini: null, codex: null },
+    current_turn: 'claude', action: 'spec', status: 'IN_PROGRESS', round: 1, max_rounds: 3,
+    active_skills: [], notes: '', last_evidence: null, ask_human: null, history: []
+  }));
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=leg'], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const leg = JSON.parse(fs.readFileSync(turn, 'utf8'));
+  assert.equal(leg.current_turn, 'gemini');
+  assert.equal(leg.seq, 1);
+  assert.equal(leg.worktree, null);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'novo.json'), 'utf8')).current_turn, 'claude');
+
+  fs.writeFileSync(path.join(repo, '.agents', 'wait-claude.lock'), JSON.stringify({ pid: process.pid }));
+  const wait = runCli(['wait', '--for=claude', `--repo=${repo}`, '--ciclo=leg'], repo, { BASTAO_POLL_MS: '50' });
+  assert.equal(wait.status, 4, 'vigia legado vivo é respeitado');
 });

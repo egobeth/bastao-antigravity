@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseRoles, wakeText } from './bastao.mjs';
 import { BASTAO_CLI, ROOT, runCli, tempRepo, git } from './testutil.mjs';
 
@@ -635,7 +636,8 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
     await new Promise(r => setTimeout(r, 100));
     try {
       state = JSON.parse(fs.readFileSync(estadoPath(repo), 'utf8'));
-      if (state.conversations?.codex === 't-123') break;
+      // O id da sessão e o WAITING_HUMAN são gravados em momentos diferentes: espere os dois.
+      if (state.conversations?.codex === 't-123' && state.status === 'WAITING_HUMAN') break;
     } catch {}
   }
 
@@ -648,6 +650,9 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
   assert.ok(fakeData.argv.includes('workspace-write'));
   assert.ok(fakeData.argv.includes('-C'));
   assert.equal(fakeData.argv[fakeData.argv.indexOf('-C') + 1], path.join(repo, '.worktrees', 'teste-codex'), 'codex roda no worktree');
+  // O .git do worktree fica na pasta principal: sem isso o sandbox não deixa o Codex commitar.
+  assert.equal(fakeData.argv[fakeData.argv.indexOf('--add-dir') + 1], path.join(repo, '.git'));
+  assert.ok(fakeData.argv.indexOf('--add-dir') < fakeData.argv.indexOf('-'), '--add-dir vem antes do prompt');
   assert.ok(fakeData.argv.includes('-'));
   assert.ok(fakeData.stdin.includes('Vez de: codex'));
   assert.ok(fakeData.stdin.includes(notesComAcento));
@@ -1341,4 +1346,80 @@ test('pass que não consegue acordar não avisa quando o vigia do gemini está v
   assert.ok(!fs.existsSync(aviso) || !fs.readFileSync(aviso, 'utf8').includes('não consigo'));
   assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'reserva.json'), 'utf8')).wake.ok, false,
     'o vigia vê o envio falho e manda de novo');
+});
+
+// --- Pontos menores da revisão final ---
+
+test('status --todos tolera entradas malformadas no índice', () => {
+  const indice = path.join(ROOT, `indice-malformado-${Date.now()}.json`);
+  fs.writeFileSync(indice, JSON.stringify({ ciclos: [null, { slug: 'x' }, { repo: 1, slug: 'y' }, 'z'] }));
+  const res = runCli(['status', '--todos'], ROOT, { BASTAO_INDEX: indice });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const repo = tempRepo();
+  const init = runCli(['init', '--task=i', '--slug=ok', '--spec=s', '--plan=p', `--repo=${repo}`], repo, { BASTAO_INDEX: indice });
+  assert.equal(init.status, 0, `stderr: ${init.stderr}`);
+});
+
+test('resumo do status mostra os ciclos bons mesmo com um estado corrompido', () => {
+  const { repo, estado } = doisCiclos();
+  fs.writeFileSync(estado('a'), '{quebrado');
+  const res = runCli(['status', `--repo=${repo}`], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.match(res.stdout, /^a · .*inválido/m);
+  assert.match(res.stdout, /^b · vez de claude/m);
+});
+
+test('ciclo que saiu do índice volta ao ser usado', () => {
+  const indice = path.join(ROOT, `indice-volta-${Date.now()}.json`);
+  const repo = tempRepo();
+  runCli(['init', '--task=v', '--slug=volta', '--spec=s', '--plan=p', `--repo=${repo}`], repo, { BASTAO_INDEX: indice });
+  fs.writeFileSync(indice, JSON.stringify({ ciclos: [] }));
+  runCli(['status', `--repo=${repo}`, '--ciclo=volta'], repo, { BASTAO_INDEX: indice });
+  assert.deepEqual(JSON.parse(fs.readFileSync(indice, 'utf8')).ciclos.map(c => c.slug), ['volta']);
+});
+
+test('vigia com conversa nova acorda mesmo que o pass tenha acordado a antiga', () => {
+  const { repo } = cicloComGemini('troca', 'conv-velha');
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const env = { BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, BASTAO_POLL_MS: '50' };
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=troca'], repo, env);
+  const res = runCli(['wait', '--for=gemini', '--wake=conv-nova', `--repo=${repo}`, '--ciclo=troca'], repo, env);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const ids = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(l => JSON.parse(l)[2]);
+  assert.deepEqual(ids, ['conv-velha', 'conv-nova']);
+});
+
+test('gravações simultâneas do estado não quebram (tmp por processo)', async () => {
+  const dir = fs.mkdtempSync(path.join(ROOT, 'concorrencia-'));
+  const file = path.join(dir, 'estado.json');
+  const script = path.join(dir, 'grava.mjs');
+  fs.writeFileSync(script, `import { writeState } from ${JSON.stringify(pathToFileURL(BASTAO_CLI).href)};
+for (let i = 0; i < 300; i++) writeState(process.argv[2], { i, quem: process.pid });
+`);
+  const roda = () => new Promise(resolve => spawn(process.execPath, [script, file]).on('close', resolve));
+  const codes = await Promise.all([roda(), roda(), roda()]);
+  assert.deepEqual(codes, [0, 0, 0]);
+  assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).i >= 0);
+});
+
+test('repositório com --separate-git-dir guarda .agents e .worktrees na pasta de trabalho', () => {
+  const base = fs.mkdtempSync(path.join(ROOT, 'sepgit-'));
+  const repo = path.join(base, 'trabalho');
+  const gitdir = path.join(base, 'gitdir');
+  git(base, 'init', `--separate-git-dir=${gitdir}`, repo);
+  git(repo, 'commit', '--allow-empty', '-m', 'init');
+  const res = runCli(['init', '--task=s', '--slug=sep', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(fs.existsSync(path.join(repo, '.agents', 'ciclos', 'sep.json')));
+  assert.ok(fs.existsSync(path.join(repo, '.worktrees', 'sep')));
+  assert.ok(!fs.existsSync(path.join(base, '.agents')));
+});
+
+test('init recusa slug igual ao do ciclo legado', () => {
+  const repo = tempRepo();
+  fs.mkdirSync(path.join(repo, '.agents'));
+  fs.writeFileSync(path.join(repo, '.agents', 'turn.json'), JSON.stringify({ version: 2, slug: 'leg', status: 'IN_PROGRESS', current_turn: 'claude', history: [] }));
+  const res = runCli(['init', '--task=l', '--slug=leg', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /legado/);
 });

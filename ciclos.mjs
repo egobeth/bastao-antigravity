@@ -5,15 +5,25 @@ import { BastaoError } from './erro.mjs';
 
 export const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 
-function gitOut(dir, args) {
+function gitRaw(dir, args) {
   const res = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
   if (res.status !== 0 || !res.stdout) throw new BastaoError('Diretório não é um repositório git', 'NOT_GIT');
-  return path.normalize(res.stdout.trim());
+  return res.stdout.trim();
 }
 
-// Pasta principal do repositório, a mesma vista de qualquer worktree.
+const gitOut = (dir, args) => path.normalize(gitRaw(dir, args));
+
+// Pasta principal do repositório, a mesma vista de qualquer worktree. Não usa o pai do .git, que erra com
+// --separate-git-dir e submódulos: na pasta principal é o toplevel; num worktree, o primeiro da lista.
 export function mainRepoOf(dir) {
-  return path.dirname(gitOut(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+  const [gitDir, commonDir] = gitRaw(dir, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'])
+    .split(/\r?\n/).map(p => path.normalize(p));
+  if (gitDir === commonDir) return gitOut(dir, ['rev-parse', '--show-toplevel']);
+  return path.normalize(gitRaw(dir, ['worktree', 'list', '--porcelain']).split(/\r?\n/)[0].replace(/^worktree /, ''));
+}
+
+export function gitCommonDir(dir) {
+  return gitOut(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
 }
 
 export function toplevelOf(dir) {
@@ -90,17 +100,32 @@ export function readIndex() {
   if (!fs.existsSync(file)) return { ciclos: [], corrupt: false };
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return { ciclos: Array.isArray(data.ciclos) ? data.ciclos : [], corrupt: false };
+    const ciclos = Array.isArray(data?.ciclos) ? data.ciclos : [];
+    return { ciclos: ciclos.filter(e => typeof e?.repo === 'string' && typeof e?.slug === 'string'), corrupt: false };
   } catch {
     return { ciclos: [], corrupt: true };
   }
 }
 
-function writeIndex(ciclos) {
-  const file = indexPath();
+// Grava via .tmp próprio do processo: dois processos gravando juntos não disputam o mesmo .tmp.
+export function writeJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file + '.tmp', JSON.stringify({ ciclos }, null, 2) + '\n', 'utf8');
-  fs.renameSync(file + '.tmp', file);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  // No Windows o rename falha (EPERM/EBUSY) enquanto outro processo troca o mesmo arquivo; tenta de novo.
+  for (let tentativa = 1; ; tentativa++) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (err) {
+      if (tentativa >= 20 || !['EPERM', 'EBUSY', 'EACCES'].includes(err.code)) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 * tentativa);
+    }
+  }
+}
+
+function writeIndex(ciclos) {
+  writeJson(indexPath(), { ciclos });
 }
 
 const sameEntry = (e, repo, slug) => e.slug === slug && path.normalize(e.repo).toLowerCase() === path.normalize(repo).toLowerCase();

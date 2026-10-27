@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { BastaoError } from './erro.mjs';
 import {
   SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, listCycles, resolveCycle,
-  indexPath, readIndex, addToIndex, removeFromIndex
+  indexPath, readIndex, addToIndex, removeFromIndex, writeJson, gitCommonDir
 } from './ciclos.mjs';
 import { lastActivity, decideStall, isParado } from './parada.mjs';
 
@@ -278,10 +278,7 @@ export async function readState(file) {
 }
 
 export function writeState(file, state) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmpPath = file + '.tmp';
-  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', 'utf8');
-  fs.renameSync(tmpPath, file);
+  writeJson(file, state);
 }
 
 export function worktreeList(mainRepo) {
@@ -318,13 +315,14 @@ export function ensureWorktree(mainRepo, slug, base) {
 }
 
 export function ensureExclude(repo) {
-  const excludePath = path.join(repo, '.git', 'info', 'exclude');
+  const excludePath = path.join(gitCommonDir(repo), 'info', 'exclude');
   const dir = path.dirname(excludePath);
   fs.mkdirSync(dir, { recursive: true });
   let content = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf8') : '';
   const linesToAdd = [
     '.agents/turn.json',
     '.agents/turn.json.tmp',
+    '.agents/*.tmp',
     '.agents/*.lock',
     '.agents/live/',
     '.agents/ciclos/',
@@ -358,9 +356,7 @@ function readCreds() {
 export function saveCreds(conversationId, ls, csrf) {
   const file = credsPath();
   const conversas = { ...readCreds(), [conversationId]: { ls, csrf, at: new Date().toISOString() } };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file + '.tmp', JSON.stringify({ conversas }, null, 2) + '\n', 'utf8');
-  fs.renameSync(file + '.tmp', file);
+  writeJson(file, { conversas });
 }
 
 function agentApiEnv(wakeId) {
@@ -410,7 +406,8 @@ export async function mergeState(file, seq, fn) {
 // O pass grava wake.ok = null antes de enviar; o vigia não manda outro enquanto o envio é recente.
 export function wakeHandled(state, now = Date.now()) {
   const w = state.wake;
-  return w?.seq === state.seq && (w.ok === true || (w.ok === null && now - Date.parse(w.at) < 60000));
+  return w?.seq === state.seq && (w.conv ?? null) === (state.conversations?.gemini ?? null)
+    && (w.ok === true || (w.ok === null && now - Date.parse(w.at) < 60000));
 }
 
 // Envia a mensagem de acordar à conversa registrada do Gemini e grava o resultado no estado.
@@ -419,7 +416,7 @@ export async function wakeGemini(file, state, opts) {
   const ok = sendAgentApiMessage(state.conversations.gemini, wakeText(state, opts));
   await mergeState(file, state.seq, cur => ({
     ...cur,
-    wake: { seq: state.seq, at, ok },
+    wake: { seq: state.seq, at, ok, conv: state.conversations.gemini },
     history: [...(cur.history || []), {
       at,
       from: 'bastao',
@@ -681,8 +678,8 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
   const repoName = path.basename(mainRepo);
   const resolve = explicitRequired => {
     const cycle = resolveCycle({ mainRepo, toplevel, ciclo: flag('ciclo'), explicitRequired });
-    // Ciclos legados não passaram pelo init novo: entram no índice quando usados.
-    if (cycle.legacy) addToIndex(mainRepo, cycle.slug);
+    // Todo ciclo usado volta ao índice (o legado nunca passou pelo init; outro pode ter sido podado).
+    addToIndex(mainRepo, cycle.slug);
     return cycle;
   };
   const instr = (state, cycle) => formatInstructions(state, { repoName, worktreeAbs: cycle.paths.worktree });
@@ -752,6 +749,9 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       throw new BastaoError(`Slug inválido "${slug}" (use letras minúsculas, números e hífen)`, 'INVALID_ARGS');
     }
     const paths = cyclePaths(mainRepo, slug, false);
+    if (listCycles(mainRepo).some(c => c.legacy && c.slug === slug)) {
+      throw new BastaoError(`"${slug}" é o ciclo legado (.agents/turn.json) deste repositório; use outro --slug`, 'ACTIVE_CYCLE');
+    }
     if (fs.existsSync(paths.state) && !values.force) {
       throw new BastaoError(`Já existe um ciclo "${slug}" neste repositório. Use --force para sobrescrever.`, 'ACTIVE_CYCLE');
     }
@@ -843,7 +843,7 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     const acordarGemini = nextState.current_turn === 'gemini' && nextState.status === 'IN_PROGRESS';
     // Marca o envio antes de enviar, para o vigia do Gemini não mandar outro ao mesmo tempo.
     if (acordarGemini && nextState.conversations?.gemini) {
-      nextState.wake = { seq: nextState.seq, at: new Date().toISOString(), ok: null };
+      nextState.wake = { seq: nextState.seq, at: new Date().toISOString(), ok: null, conv: nextState.conversations.gemini };
     }
 
     writeState(file, nextState);
@@ -927,8 +927,12 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     } catch (err) {
       if (err.code === 'AMBIGUOUS_CYCLE') {
         for (const c of listCycles(mainRepo)) {
-          const st = await readState(cyclePaths(mainRepo, c.slug, c.legacy).state);
-          console.log(`${c.slug} · vez de ${st.current_turn} · ${st.action} · ${st.status}`);
+          try {
+            const st = await readState(cyclePaths(mainRepo, c.slug, c.legacy).state);
+            console.log(`${c.slug} · vez de ${st.current_turn} · ${st.action} · ${st.status}`);
+          } catch (e) {
+            console.log(`${c.slug} · ${e.message}`);
+          }
         }
         console.log('Indique o ciclo com --ciclo=<slug>.');
         return;
@@ -1118,6 +1122,8 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     }
 
     let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', workDir];
+    // No worktree, o .git (objetos e refs) fica na pasta principal: o sandbox precisa liberá-lo para o commit.
+    if (cycle.paths.worktree) codexArgs.push('--add-dir', gitCommonDir(mainRepo));
     if (state.conversations?.codex) {
       codexArgs.push('resume', state.conversations.codex);
     }

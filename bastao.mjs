@@ -339,20 +339,52 @@ export function ensureExclude(repo) {
   }
 }
 
+// O agentapi só fala com o Antigravity tendo o endereço e o token do servidor dele, que só existem nos
+// terminais do Antigravity. O vigia do Gemini os guarda aqui, no perfil (fora do repositório e do OneDrive),
+// para o pass e os vigias de fora (Claude no VSCode, Codex) também conseguirem acordá-lo.
+export function credsPath() {
+  return process.env.BASTAO_CREDS
+    || path.join(process.env.USERPROFILE || process.env.HOME || '', '.agents', 'bastao-antigravity.json');
+}
+
+function readCreds() {
+  try {
+    return JSON.parse(fs.readFileSync(credsPath(), 'utf8')).conversas || {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveCreds(conversationId, ls, csrf) {
+  const file = credsPath();
+  const conversas = { ...readCreds(), [conversationId]: { ls, csrf, at: new Date().toISOString() } };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file + '.tmp', JSON.stringify({ conversas }, null, 2) + '\n', 'utf8');
+  fs.renameSync(file + '.tmp', file);
+}
+
+function agentApiEnv(wakeId) {
+  if (process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN) return process.env;
+  const c = readCreds()[wakeId];
+  return c ? { ...process.env, ANTIGRAVITY_LS_ADDRESS: c.ls, ANTIGRAVITY_CSRF_TOKEN: c.csrf } : process.env;
+}
+
 export function sendAgentApiMessage(wakeId, text) {
   const bin = process.env.BASTAO_AGENTAPI
     || path.join(process.env.USERPROFILE || '', '.gemini', 'antigravity-ide', 'bin', 'agentapi.bat');
   // Um agentapi travado não pode segurar o pass nem o vigia.
   const timeout = 15000;
+  const env = agentApiEnv(wakeId);
   if (bin.endsWith('.mjs')) {
-    return spawnSync(process.execPath, [bin, 'send-message', '--title=Bastao', wakeId, text], { windowsHide: true, timeout }).status === 0;
+    return spawnSync(process.execPath, [bin, 'send-message', '--title=Bastao', wakeId, text], { windowsHide: true, timeout, env }).status === 0;
   }
   // cmd /s /c remove o primeiro e o último ", por isso a linha inteira vai entre aspas e sem o escape do libuv.
   // wakeId é validado no wait e o texto é fixo (sem & | < > ^ " %).
   const res = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${bin}" send-message --title=Bastao ${wakeId} "${text}""`], {
     windowsHide: true,
     windowsVerbatimArguments: true,
-    timeout
+    timeout,
+    env
   });
   return res.status === 0;
 }
@@ -526,7 +558,7 @@ export async function main() {
   pass    --from= --to= --action= [--notes=] [--evidence=] [--skills=a,b] [--roles=implement:x,review:y+z] [--parado-min=] [--force]
   ask     --from= --question=
   pause
-  wait    --for=<claude|gemini|codex> [--wake=<id>, obrigatório para gemini] [--timeout-min=240]
+  wait    --for=<claude|gemini|codex> [--wake=<id>, gemini fora do Antigravity] [--timeout-min=240]
   fim     (só com ok do usuário: remove o worktree limpo e encerra o ciclo; a branch fica)
   install [--yes]
 Todos aceitam --repo=<dir> e --ciclo=<slug>. Dentro de .worktrees/<slug> o ciclo é deduzido; na pasta
@@ -821,7 +853,8 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     if (acordarGemini) {
       const woke = !!nextState.conversations?.gemini
         && await wakeGemini(file, nextState, { repoName, worktreeAbs: cycle.paths.worktree });
-      if (!woke) {
+      // Com o vigia do Gemini vivo (ele roda no Antigravity), ele vê o envio falho e acorda o Gemini.
+      if (!woke && !isLockAlive(cycle.paths.lock('gemini'))) {
         const msg = `[BASTAO] ${nextState.slug}: vez do gemini, mas não consigo acordá-lo. `
           + `Abra o Gemini em ${cycle.paths.worktree || mainRepo} e diga "retome o bastão ${nextState.slug}".`;
         avisar(msg);
@@ -945,11 +978,13 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     if (!['claude', 'gemini', 'codex'].includes(forAgent)) {
       throw new BastaoError(`Agente inválido: ${forAgent}`, 'INVALID_ARGS');
     }
-    if (forAgent === 'gemini' && !values.wake) {
-      throw new BastaoError('wait --for=gemini exige --wake=<Conversation ID>; sem ele ninguém acorda o Gemini', 'INVALID_ARGS');
+    // Dentro do Antigravity a conversa do Gemini vem do ambiente; fora dele, só pelo --wake.
+    const wakeId = values.wake || (forAgent === 'gemini' ? process.env.ANTIGRAVITY_CONVERSATION_ID : null);
+    if (forAgent === 'gemini' && !wakeId) {
+      throw new BastaoError('wait --for=gemini exige --wake=<Conversation ID> fora do Antigravity; sem ele ninguém acorda o Gemini', 'INVALID_ARGS');
     }
-    if (values.wake && !/^[\w-]+$/.test(values.wake)) {
-      throw new BastaoError(`--wake inválido: ${values.wake} (use o Conversation ID)`, 'INVALID_ARGS');
+    if (wakeId && !/^[\w-]+$/.test(wakeId)) {
+      throw new BastaoError(`--wake inválido: ${wakeId} (use o Conversation ID)`, 'INVALID_ARGS');
     }
     if (!(await readState(file))) throw new BastaoError('Nenhum ciclo ativo neste repositório', 'NO_CYCLE');
     const lockPath = cycle.paths.lock(forAgent);
@@ -971,8 +1006,10 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     process.on('exit', cleanLock);
 
     try {
-      const wakeId = values.wake;
       if (wakeId) {
+        if (process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN) {
+          saveCreds(wakeId, process.env.ANTIGRAVITY_LS_ADDRESS, process.env.ANTIGRAVITY_CSRF_TOKEN);
+        }
         const state = await readState(file);
         if (state && state.conversations?.gemini !== wakeId) {
           await mergeState(file, state.seq, cur => ({ ...cur, conversations: { ...cur.conversations, gemini: wakeId } }));

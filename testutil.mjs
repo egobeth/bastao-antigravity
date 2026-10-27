@@ -16,6 +16,9 @@ process.env.BASTAO_INDEX = path.join(ROOT, 'indice.json');
 const agentapiNulo = path.join(ROOT, 'agentapi-nulo.mjs');
 fs.writeFileSync(agentapiNulo, 'process.exit(0);\n');
 process.env.BASTAO_AGENTAPI = agentapiNulo;
+// Nem as credenciais reais do Antigravity (os testes podem rodar num terminal dele).
+process.env.BASTAO_CREDS = path.join(ROOT, 'credenciais.json');
+for (const v of ['ANTIGRAVITY_CONVERSATION_ID', 'ANTIGRAVITY_LS_ADDRESS', 'ANTIGRAVITY_CSRF_TOKEN']) delete process.env[v];
 
 export function runCli(args, cwd, env = {}) {
   return spawnSync(process.execPath, [BASTAO_CLI, ...args], {

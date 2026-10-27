@@ -100,7 +100,7 @@ bastao fim --ciclo=csv-export                   # after the merge: removes the c
 ```
 
 - Inside `.worktrees/<slug>` the cycle is inferred. In the main folder, `pass`/`ask`/`wait`/`fim` require `--ciclo`.
-- `pass` wakes Gemini right away; Gemini's watcher requires `--wake=<id>`. If the baton holder shows no activity for 15 min (`--parado-min`), Gemini is re-woken once and, if still idle, you are notified and `status` shows PARADO. `BASTAO_REWAKE=off` disables the re-wake.
+- `pass` wakes Gemini right away; Gemini's watcher, run in an Antigravity terminal, reads its conversation id from `ANTIGRAVITY_CONVERSATION_ID` and stores Antigravity's address and token in `%USERPROFILE%\.agents\bastao-antigravity.json` so Claude and Codex can wake it too (outside Antigravity, pass `--wake=<id>`). If the baton holder shows no activity for 15 min (`--parado-min`), Gemini is re-woken once and, if still idle, you are notified and `status` shows PARADO. `BASTAO_REWAKE=off` disables the re-wake.
 - Old cycles in `.agents/turn.json` keep working until `fim`.
 - Make each repository's vitest, eslint and tsconfig ignore `.worktrees/**`; otherwise tests and lint in the main folder read the worktrees. `init` warns when it is missing.
 

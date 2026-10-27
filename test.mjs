@@ -361,6 +361,11 @@ const log = process.env.FAKE_LOG;
 if (log) {
   fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + '\\n', 'utf8');
 }
+if (process.env.FAKE_ENV_LOG) {
+  fs.appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify({
+    ls: process.env.ANTIGRAVITY_LS_ADDRESS ?? null, csrf: process.env.ANTIGRAVITY_CSRF_TOKEN ?? null
+  }) + '\\n', 'utf8');
+}
 process.exit(Number(process.env.FAKE_EXIT ?? 0));
 `, 'utf8');
   return { scriptPath, logPath };
@@ -1290,4 +1295,50 @@ test('pass limpa a parada anterior e done não mostra PARADO', () => {
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).stall, null);
   assert.doesNotMatch(runCli(['status', `--repo=${repo}`, '--ciclo=stall'], repo).stdout, /PARADO/);
+});
+
+// --- Credenciais do Antigravity (Teste 0: agentapi só funciona com endereço e token) ---
+
+test('vigia do gemini no Antigravity usa ANTIGRAVITY_CONVERSATION_ID e guarda as credenciais fora do repo', () => {
+  const { repo, file } = cicloComGemini('cred', null);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=cred'], repo);
+  const creds = path.join(ROOT, `creds-${Date.now()}.json`);
+  const res = runCli(['wait', '--for=gemini', `--repo=${repo}`, '--ciclo=cred'], repo, {
+    BASTAO_CREDS: creds, BASTAO_POLL_MS: '50',
+    ANTIGRAVITY_CONVERSATION_ID: 'conv-env', ANTIGRAVITY_LS_ADDRESS: 'localhost:1234', ANTIGRAVITY_CSRF_TOKEN: 'tok-secreto'
+  });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).conversations.gemini, 'conv-env');
+  const salvo = JSON.parse(fs.readFileSync(creds, 'utf8')).conversas['conv-env'];
+  assert.equal(salvo.ls, 'localhost:1234');
+  assert.equal(salvo.csrf, 'tok-secreto');
+  const noRepo = fs.readdirSync(path.join(repo, '.agents'), { recursive: true })
+    .map(f => path.join(repo, '.agents', f)).filter(f => fs.statSync(f).isFile())
+    .some(f => fs.readFileSync(f, 'utf8').includes('tok-secreto'));
+  assert.equal(noRepo, false, 'token nunca vai para o repositório');
+});
+
+test('pass fora do Antigravity acorda o gemini com as credenciais gravadas', () => {
+  const { repo } = cicloComGemini('fora', 'conv-f');
+  const creds = path.join(ROOT, `creds-fora-${Date.now()}.json`);
+  fs.writeFileSync(creds, JSON.stringify({ conversas: { 'conv-f': { ls: 'localhost:999', csrf: 'tok-f', at: new Date().toISOString() } } }));
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const envLog = logPath + '.env';
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=fora'], repo,
+    { BASTAO_CREDS: creds, BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, FAKE_ENV_LOG: envLog });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(envLog, 'utf8').trim()), { ls: 'localhost:999', csrf: 'tok-f' });
+});
+
+test('pass que não consegue acordar não avisa quando o vigia do gemini está vivo', () => {
+  const { repo } = cicloComGemini('reserva', 'conv-r');
+  fs.writeFileSync(path.join(repo, '.agents', 'ciclos', 'reserva.wait-gemini.lock'), JSON.stringify({ pid: process.pid }));
+  const { scriptPath } = setupFakeAgentApi();
+  const aviso = path.join(ROOT, `aviso-reserva-${Date.now()}.log`);
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=reserva'], repo,
+    { BASTAO_AGENTAPI: scriptPath, FAKE_EXIT: '1', BASTAO_NOTIFY: aviso });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(!fs.existsSync(aviso) || !fs.readFileSync(aviso, 'utf8').includes('não consigo'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'reserva.json'), 'utf8')).wake.ok, false,
+    'o vigia vê o envio falho e manda de novo');
 });

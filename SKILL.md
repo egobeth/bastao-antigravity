@@ -31,8 +31,8 @@ Protocolo de passagem de turno e handoff conversacional contínuo entre Claude C
 - Ao esperar sua vez: execute `bastao wait --for=claude --ciclo=<slug>` com `run_in_background`. Quando o comando terminar, sua sessão será reativada automaticamente.
 
 ### Gemini (Antigravity)
-- Obtenha o seu Conversation ID nos metadados da sessão.
-- Ao esperar sua vez: execute `bastao wait --for=gemini --wake=<id> --ciclo=<slug>` em segundo plano e encerre seu turno. **`--wake` é obrigatório**: é ele que registra sua conversa no ciclo para o `pass` te acordar.
+- Ao esperar sua vez: execute `bastao wait --for=gemini --ciclo=<slug>` em segundo plano, **num terminal do Antigravity**, e encerre seu turno. O vigia lê seu Conversation ID de `ANTIGRAVITY_CONVERSATION_ID` e guarda no seu perfil o endereço e o token do Antigravity, para o `pass` do Claude e do Codex conseguirem te acordar. Fora do Antigravity, passe `--wake=<id>`.
+- Rearme o vigia a cada turno: se o Antigravity reiniciar, o token muda e só o vigia grava o novo.
 - Uma conversa por ciclo. Numa conversa nova ("retome o bastão"), o `wait` com o novo ID substitui o antigo.
 - A mensagem de acordar diz o ciclo e o workspace: abra/use esse worktree.
 
@@ -51,7 +51,7 @@ Protocolo de passagem de turno e handoff conversacional contínuo entre Claude C
 | Código | O que fazer |
 |---|---|
 | 0 | é sua vez: siga as instruções impressas |
-| 1 | erro: leia a mensagem (ex.: falta `--ciclo`, falta `--wake` no Gemini, ciclo inexistente) e corrija o comando |
+| 1 | erro: leia a mensagem (ex.: falta `--ciclo`, falta `--wake` no Gemini fora do Antigravity, ciclo inexistente) e corrija o comando |
 | 2 | tempo esgotado: arme o `wait` de novo |
 | 3 | ciclo `APPROVED`, `MAX_ROUNDS_REACHED` ou `MANUAL_PAUSE`: rode `bastao status` e avise o usuário; não rearme |
 | 4 | já existe vigia vivo para você neste ciclo: não arme outro |

@@ -120,7 +120,7 @@ Todos aceitam `--ciclo=<slug>` além de `--repo=<dir>`.
   O caminho é omitido se contiver caractere proibido pelo `cmd` (`& | < > ^ " %`).
 - O vigia do Gemini continua como reserva: ao ver que é a vez dele, só envia a mensagem se `wake.seq` for
   diferente do `seq` atual ou `wake.ok` for falso.
-- `wait --for=gemini` sem `--wake` → erro `INVALID_ARGS`.
+- `wait --for=gemini` sem `--wake` e fora do Antigravity (sem `ANTIGRAVITY_CONVERSATION_ID`) → erro `INVALID_ARGS`.
 - Claude (só o próprio vigia o acorda) e Codex (iniciado pelo `pass`) não mudam.
 - Toda notificação ao usuário passa a trazer `<repo>/<slug>`.
 
@@ -140,11 +140,16 @@ Todos aceitam `--ciclo=<slug>` além de `--repo=<dir>`.
 - Sem vigia vivo, `status`/`status --todos` calculam a inatividade na hora (só exibem, não gravam nem enviam).
 - Corrida entre dois vigias do mesmo ciclo é tolerada: no pior caso, duas mensagens.
 
-### Risco a verificar primeiro
+### Risco verificado (Teste 0, 2026-10-27)
 
-Não se sabe o que `agentapi send-message` faz com uma conversa do Gemini que está no meio de um turno. Primeira
-tarefa do plano: testar com o usuário. Se a mensagem for enfileirada, o desenho acima vale. Se interromper o
-turno, o reenvio automático é desligado e a inatividade só gera aviso ao usuário.
+- Mensagem enviada com o Gemini rodando `Start-Sleep 180`: entregue na hora, o Gemini respondeu no meio e o
+  comando **não** foi interrompido. O reenvio automático fica ligado (`BASTAO_REWAKE=off` desliga).
+- O `agentapi` só funciona com `ANTIGRAVITY_LS_ADDRESS` e `ANTIGRAVITY_CSRF_TOKEN`, que só existem nos terminais do
+  Antigravity. Por isso o vigia do Gemini (que roda lá) guarda os dois por conversa em
+  `%USERPROFILE%\.agents\bastao-antigravity.json` (fora do repositório e do OneDrive) e o `pass`/os vigias de fora
+  os usam. O vigia lê o ID da conversa de `ANTIGRAVITY_CONVERSATION_ID`; `--wake` só é exigido fora do Antigravity.
+- Se o envio do `pass` falhar e houver vigia do Gemini vivo, o usuário não é avisado: o vigia vê `wake.ok = false`
+  e acorda o Gemini.
 
 ## 5. Skill (SKILL.md)
 
@@ -152,7 +157,7 @@ turno, o reenvio automático é desligado e a inatividade só gera aviso ao usu�
   antes de editar.
 - "Retome o bastão": rodar `bastao status`; se listar vários ciclos, perguntar ao usuário qual (ou usar o nome
   que ele deu).
-- Gemini: `wait` sempre com `--wake=<id>`.
+- Gemini: `wait` num terminal do Antigravity (ID e credenciais vêm do ambiente); fora dele, `--wake=<id>`.
 - `fim` só com ok do usuário, depois do merge.
 - Tabela de saídas do `wait` ganha o erro de ciclo ambíguo.
 

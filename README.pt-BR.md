@@ -100,7 +100,7 @@ bastao fim --ciclo=exportar-csv                 # depois do merge: remove o work
 ```
 
 - Dentro de `.worktrees/<slug>` o ciclo é deduzido. Na pasta principal, `pass`/`ask`/`wait`/`fim` exigem `--ciclo`.
-- O `pass` acorda o Gemini na hora; o vigia do Gemini exige `--wake=<id>`. Dono do bastão sem atividade por 15 min (`--parado-min`): o Gemini é reacordado uma vez e, persistindo, você é avisado e o `status` mostra PARADO. `BASTAO_REWAKE=off` desliga o reenvio.
+- O `pass` acorda o Gemini na hora; o vigia do Gemini, rodando num terminal do Antigravity, lê o ID da conversa de `ANTIGRAVITY_CONVERSATION_ID` e guarda o endereço e o token do Antigravity em `%USERPROFILE%\.agents\bastao-antigravity.json` para o Claude e o Codex também conseguirem acordá-lo (fora do Antigravity, passe `--wake=<id>`). Dono do bastão sem atividade por 15 min (`--parado-min`): o Gemini é reacordado uma vez e, persistindo, você é avisado e o `status` mostra PARADO. `BASTAO_REWAKE=off` desliga o reenvio.
 - Ciclos antigos em `.agents/turn.json` seguem funcionando até o `fim`.
 - Faça vitest, eslint e tsconfig de cada repositório ignorarem `.worktrees/**`; senão testes e lint da pasta principal leem os worktrees. O `init` avisa quando falta.
 

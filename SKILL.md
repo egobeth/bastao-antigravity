@@ -9,54 +9,73 @@ Protocolo de passagem de turno e handoff conversacional contínuo entre Claude C
 
 ## 1. Princípios Gerais
 
-- **Fonte da verdade:** `.agents/turn.json` na raiz do repositório git.
+- **Vários ciclos ao mesmo tempo:** cada repositório pode ter vários bastões (ciclos), cada um com seu nome (`slug`), sua branch `ai/<slug>` e seu **worktree** `<repo>/.worktrees/<slug>`. Repositórios diferentes também têm ciclos independentes.
+- **Fonte da verdade:** `.agents/ciclos/<slug>.json` na pasta principal do repositório. Ciclos antigos (`.agents/turn.json`) continuam funcionando até serem encerrados, sem worktree.
 - **Divisão padrão de papéis:**
   - Claude: especificação, planejamento e revisão.
   - Gemini: implementação (maior cota de contexto).
   - Codex: implementação ou revisão complementar via `exec resume`.
-- **Branch de trabalho:** todo trabalho de IA acontece na branch `ai/<slug>`. Nunca altere nem faça commits diretamente na `main` ou `master`.
-- **Proibições sem autorização explícita do usuário:** merge, push, deploy, apagar branches e alterar arquivos fora do repositório.
+- **Onde trabalhar:** só no worktree do ciclo. A pasta principal fica com o usuário e o `master`/`main`; nunca edite nem faça commits nela. Antes de editar, confirme que `git rev-parse --show-toplevel` é o worktree do ciclo. Na primeira vez no worktree, rode `npm install` (ou o equivalente) lá.
+- **Proibições sem autorização explícita do usuário:** merge, push, deploy, apagar branches, `bastao fim` e alterar arquivos fora do repositório.
 
-## 2. Regras por Agente
+## 2. Qual ciclo
+
+- Dentro de `.worktrees/<slug>` (ou subpasta), o ciclo é deduzido; não precisa de `--ciclo`.
+- Na pasta principal, `pass`, `ask`, `wait` e `fim` exigem `--ciclo=<slug>`. Com mais de um ciclo e nenhum indicado, os comandos falham listando os ciclos; `status` lista o resumo de cada um.
+- `bastao status --todos` mostra todos os ciclos de todos os repositórios: dono, há quanto tempo, vigias, se dá para acordar o dono e **PARADO**.
+- Nos exemplos abaixo, `--ciclo=<slug>` pode ser omitido quando você estiver dentro do worktree.
+
+## 3. Regras por Agente
 
 ### Claude Code
-- Ao esperar sua vez: execute `bastao wait --for=claude` com `run_in_background`. Quando o comando terminar, sua sessão será reativada automaticamente.
+- Ao esperar sua vez: execute `bastao wait --for=claude --ciclo=<slug>` com `run_in_background`. Quando o comando terminar, sua sessão será reativada automaticamente.
 
 ### Gemini (Antigravity)
 - Obtenha o seu Conversation ID nos metadados da sessão.
-- Ao esperar sua vez: execute `bastao wait --for=gemini --wake=<id>` em segundo plano e encerre seu turno. O vigia acordará esta conversa quando chegar sua vez.
-- Nunca use vigia sem passar o seu ID atualizado. Numa conversa nova ("retome o bastão"), o `wait` com o novo ID substitui o antigo.
+- Ao esperar sua vez: execute `bastao wait --for=gemini --wake=<id> --ciclo=<slug>` em segundo plano e encerre seu turno. **`--wake` é obrigatório**: é ele que registra sua conversa no ciclo para o `pass` te acordar.
+- Uma conversa por ciclo. Numa conversa nova ("retome o bastão"), o `wait` com o novo ID substitui o antigo.
+- A mensagem de acordar diz o ciclo e o workspace: abra/use esse worktree.
 
 ### Codex
-- **Nunca arma vigia.** O Codex é acionado diretamente pelo comando `bastao pass --to=codex` e encerra sua execução assim que passar o bastão.
-- A saída do Codex fica em `.agents/live/codex.log`, com um separador `=== Round r/m · <ação> · HH:MM ===` por turno.
+- **Nunca arma vigia.** O Codex é acionado diretamente pelo comando `bastao pass --to=codex` e roda no worktree do ciclo; encerra sua execução assim que passar o bastão.
+- A saída do Codex fica em `.agents/live/<slug>/codex.log`, com um separador `=== Round r/m · <ação> · HH:MM ===` por turno.
 - Se o Codex terminar sem passar o bastão, o ciclo vai para `WAITING_HUMAN` com a pergunta automática. Para responder, qualquer IA no chat roda, a pedido do usuário:
-  `bastao pass --from=human --to=codex --action=<ação> --force --notes="<resposta do usuário>"`
+  `bastao pass --from=human --to=codex --action=<ação> --force --ciclo=<slug> --notes="<resposta do usuário>"`
+
+### Acordar e parada
+- `bastao pass --to=gemini` acorda o Gemini na hora pela conversa registrada. Sem conversa registrada, o usuário é avisado para abrir o Gemini no worktree e dizer "retome o bastão <slug>".
+- Os vigias observam o dono do bastão: sem atividade (arquivos, commits ou passagens) por `parado_min` minutos (padrão 15, ajustável com `--parado-min` no `init` ou no `pass`), o Gemini recebe uma nova mensagem ("se já estiver trabalhando, ignore") e, persistindo, o usuário é avisado e o `status` mostra PARADO.
+- Recebeu uma mensagem de reacordar e já está trabalhando? Ignore e siga.
 
 ### Saídas do `wait`
 | Código | O que fazer |
 |---|---|
 | 0 | é sua vez: siga as instruções impressas |
+| 1 | erro: leia a mensagem (ex.: falta `--ciclo`, falta `--wake` no Gemini, ciclo inexistente) e corrija o comando |
 | 2 | tempo esgotado: arme o `wait` de novo |
 | 3 | ciclo `APPROVED`, `MAX_ROUNDS_REACHED` ou `MANUAL_PAUSE`: rode `bastao status` e avise o usuário; não rearme |
-| 4 | já existe vigia vivo para você: não arme outro |
+| 4 | já existe vigia vivo para você neste ciclo: não arme outro |
 | 5 | falha ao acordar o Gemini: avise o usuário |
 
-## 3. Fluxo de Trabalho
+## 4. Fluxo de Trabalho
 
 ### Iniciar um ciclo (Claude, depois que o usuário aprovar spec e plano)
-`bastao init --task="<tarefa>" --slug=<slug> --spec=<caminho> --plan=<caminho> [--implement=gemini] [--review=claude,codex] [--max-rounds=3] [--codex-thread=<id>]`
+Spec e plano precisam estar commitados na base (o worktree nasce dela).
 
-Depois, `bastao pass --from=claude --to=<implementador> --action=implement --notes="<resumo>"`. Papéis e skills mudam a qualquer momento com `--roles=implement:codex,review:claude+gemini` e `--skills=a,b` no `pass`. O usuário assume o controle com `bastao pause` e devolve com `bastao pass --from=human --to=<agente> --action=<ação>`.
+`bastao init --task="<tarefa>" --slug=<slug> --spec=<caminho> --plan=<caminho> [--base=<ref>] [--implement=gemini] [--review=claude,codex] [--max-rounds=3] [--parado-min=15] [--codex-thread=<id>]`
+
+O `init` cria `.worktrees/<slug>` na branch `ai/<slug>` (reaproveita a branch se existir) e imprime o caminho. Leia os avisos: spec/plano ausentes no worktree, ou `vitest`/`eslint`/`tsconfig` que não ignoram `.worktrees/` (avise o usuário; ignorar `.worktrees/**` é um commit à parte, com ok dele).
+
+Depois, `bastao pass --from=claude --to=<implementador> --action=implement --ciclo=<slug> --notes="<resumo>"`. Papéis e skills mudam a qualquer momento com `--roles=implement:codex,review:claude+gemini` e `--skills=a,b` no `pass`. O usuário assume o controle com `bastao pause --ciclo=<slug>` e devolve com `bastao pass --from=human --to=<agente> --action=<ação> --ciclo=<slug>`.
 
 ### Ao entrar ou retomar
-1. Execute `bastao status` para ler o estado atual do ciclo.
-2. Se for a sua vez (`Vez de: <seu-nome>`), realize o trabalho correspondente.
+1. Execute `bastao status` (no worktree do ciclo, ou com `--ciclo=<slug>`). Se ele listar vários ciclos, use o nome que o usuário deu ou pergunte qual.
+2. Se for a sua vez (`Vez de: <seu-nome>`), realize o trabalho correspondente no `Workspace:` indicado.
 3. Se não for sua vez, arme o vigia conforme as regras do seu agente e encerre o turno.
 
 ### Turno de Implementação (`implement`)
 1. Leia a spec (`Spec:`), o plano (`Plano:`), as notas (`Notas:`) e as skills ativas. Na rodada 2+, leia também a evidência de revisão anterior (`docs/evidence/<data>-<slug>-review-<N-1>.md`).
-2. Garanta que está na branch `ai/<slug>`.
+2. Garanta que está no worktree do ciclo, na branch `ai/<slug>`.
 3. Implemente as alterações e execute todos os testes e comandos de validação especificados.
 4. Faça commit das alterações na branch.
 5. Registre a evidência em `docs/evidence/<data>-<slug>-impl-<N>.md`:
@@ -69,7 +88,7 @@ Depois, `bastao pass --from=claude --to=<implementador> --action=implement --not
 7. Arme o vigia e encerre seu turno.
 
 ### Turno de Revisão (`review`)
-1. Analise o trabalho com base na spec, plano, evidência de implementação e diff da branch. Execute testes se necessário.
+1. Analise o trabalho com base na spec, plano, evidência de implementação e diff da branch (no worktree). Execute testes se necessário.
 2. Escreva seus apontamentos em `docs/evidence/<data>-<slug>-review-<N>.md` no formato padronizado:
    ```markdown
    Veredito: APROVADO | CORRIGIR (n bloqueantes, n importantes)
@@ -102,7 +121,10 @@ Depois, `bastao pass --from=claude --to=<implementador> --action=implement --not
   Apresente a pergunta no chat e encerre o turno sem armar o vigia.
 - Quando o usuário responder no chat, continue o turno normalmente e passe o bastão com `bastao pass ...`.
 
-## 4. Pré-requisitos e Execução Automática
+### Encerrar (`fim`)
+- Só com ok explícito do usuário, depois do merge: `bastao fim --ciclo=<slug>`. Remove o worktree (recusa se houver alteração não commitada ou vigia vivo), apaga o estado do ciclo e o tira do `status --todos`. A branch fica.
+
+## 5. Pré-requisitos e Execução Automática
 - `bastao` não reconhecido (terminal aberto antes do install)? Não investigue: use `node $env:USERPROFILE\.agents\bastao\bastao.mjs <comando>` ou reinicie o terminal.
-- Comece sempre por `bastao status`. Ciclo ativo → `pass`, nunca `init`. Opções de todos os comandos: `bastao --help`.
+- Comece sempre por `bastao status`. Ciclo ativo → `pass`, nunca `init` (outro `init` com outro slug cria um ciclo novo). Opções de todos os comandos: `bastao --help`.
 - No Antigravity: configure a execução automática para comandos de terminal (`bastao`, `git`, `node`, testes).

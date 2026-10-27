@@ -30,14 +30,14 @@ Agents work on an `ai/<slug>` branch and never merge, push or deploy without you
    - **Codex**: `bastao pass --to=codex` launches `codex exec` directly (see below).
 4. The reviewer either sends fixes back (`fix`, next round) or approves (`done`). Anything that needs you raises a popup.
 
-State lives in `.agents/turn.json` at the repo root, kept out of git automatically. The agent rules are in [SKILL.md](SKILL.md).
+Each cycle's state lives in `.agents/ciclos/<slug>.json` in the main folder of the repo, kept out of git automatically. The agent rules are in [SKILL.md](SKILL.md).
 
 ## Codex: runs in the background, not in your open chat
 
 The Codex panel in Antigravity does **not** refresh with turns made from outside it; that's a limitation of the Codex extension, not something bastão can fix. So Codex works like this:
 
 - Its turns run headless with `codex exec` (sandbox `workspace-write` in your repo), resuming the same Codex thread each round, so it keeps its memory of the cycle. Pass `--codex-thread=<id>` to `init` to continue a thread you already have open.
-- Everything it prints is appended live to **`.agents/live/codex.log`**, with a `=== Round r/m · action · HH:MM ===` header per turn. Follow it with:
+- Everything it prints is appended live to **`.agents/live/<slug>/codex.log`**, with a `=== Round r/m · action · HH:MM ===` header per turn. Follow it with:
   ```powershell
   Get-Content .agents\live\codex.log -Wait
   ```
@@ -86,12 +86,28 @@ bastao --help                                   # all options
 
 All commands accept `--repo=<dir>`. Set `BASTAO_NOTIFY=off` to silence popups, `BASTAO_CODEX` / `BASTAO_AGENTAPI` to override binary paths.
 
-`wait` exit codes: `0` your turn · `2` timeout, re-arm · `3` cycle approved/paused/out of rounds · `4` a watcher is already running · `5` failed to wake Gemini.
+`wait` exit codes: `1` error (e.g. missing `--ciclo`) · `0` your turn · `2` timeout, re-arm · `3` cycle approved/paused/out of rounds · `4` a watcher is already running · `5` failed to wake Gemini.
+
+## Several cycles
+
+A repository can run several batons at once. Each cycle has a name (`--slug`), the branch `ai/<slug>` and its own worktree at `<repo>/.worktrees/<slug>`, created by `init`. The agents of a cycle work only in that worktree; the main folder stays yours.
+
+```powershell
+bastao init --task="Add CSV export" --slug=csv-export --spec=docs/spec.md --plan=docs/plan.md
+bastao status --todos                           # every cycle in every repository
+bastao pass --from=claude --to=gemini --action=implement --ciclo=csv-export
+bastao fim --ciclo=csv-export                   # after the merge: removes the clean worktree
+```
+
+- Inside `.worktrees/<slug>` the cycle is inferred. In the main folder, `pass`/`ask`/`wait`/`fim` require `--ciclo`.
+- `pass` wakes Gemini right away; Gemini's watcher requires `--wake=<id>`. If the baton holder shows no activity for 15 min (`--parado-min`), Gemini is re-woken once and, if still idle, you are notified and `status` shows PARADO. `BASTAO_REWAKE=off` disables the re-wake.
+- Old cycles in `.agents/turn.json` keep working until `fim`.
+- Make each repository's vitest, eslint and tsconfig ignore `.worktrees/**`; otherwise tests and lint in the main folder read the worktrees. `init` warns when it is missing.
 
 ## Tests
 
 ```powershell
-node --test test.mjs
+node --test test.mjs ciclos.test.mjs parada.test.mjs
 ```
 
 ## License

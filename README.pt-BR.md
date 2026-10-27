@@ -30,14 +30,14 @@ Os agentes trabalham numa branch `ai/<slug>` e nunca fazem merge, push ou deploy
    - **Codex**: `bastao pass --to=codex` dispara o `codex exec` direto (veja abaixo).
 4. O revisor devolve correções (`fix`, próxima rodada) ou aprova (`done`). Tudo que precisa de você gera um popup.
 
-O estado fica em `.agents/turn.json` na raiz do repositório, fora do git automaticamente. As regras dos agentes estão no [SKILL.md](SKILL.md).
+O estado de cada ciclo fica em `.agents/ciclos/<slug>.json` na pasta principal do repositório, fora do git automaticamente. As regras dos agentes estão no [SKILL.md](SKILL.md).
 
 ## Codex: roda em segundo plano, não no chat aberto
 
 O painel do Codex no Antigravity **não** se atualiza com turnos feitos fora dele; é uma limitação da extensão do Codex, não algo que o bastão consiga resolver. Por isso o Codex funciona assim:
 
 - Os turnos rodam sem interface com `codex exec` (sandbox `workspace-write` no seu repositório), retomando a mesma thread do Codex a cada rodada, então ele mantém a memória do ciclo. Passe `--codex-thread=<id>` no `init` para continuar uma thread que você já tem aberta.
-- Tudo que ele imprime é gravado ao vivo em **`.agents/live/codex.log`**, com um cabeçalho `=== Round r/m · ação · HH:MM ===` por turno. Acompanhe com:
+- Tudo que ele imprime é gravado ao vivo em **`.agents/live/<slug>/codex.log`**, com um cabeçalho `=== Round r/m · ação · HH:MM ===` por turno. Acompanhe com:
   ```powershell
   Get-Content .agents\live\codex.log -Wait
   ```
@@ -86,12 +86,28 @@ bastao --help                                   # todas as opções
 
 Ciclo já existe? Use `status` e `pass`, nunca `init`. Todos os comandos aceitam `--repo=<dir>`. Use `BASTAO_NOTIFY=off` para silenciar os popups e `BASTAO_CODEX` / `BASTAO_AGENTAPI` para apontar outros caminhos dos binários.
 
-Códigos de saída do `wait`: `0` sua vez · `2` tempo esgotado, rearme · `3` ciclo aprovado/pausado/sem rodadas · `4` já existe um vigia ativo · `5` falha ao acordar o Gemini.
+Códigos de saída do `wait`: `1` erro (ex.: falta `--ciclo`) · `0` sua vez · `2` tempo esgotado, rearme · `3` ciclo aprovado/pausado/sem rodadas · `4` já existe um vigia ativo · `5` falha ao acordar o Gemini.
+
+## Vários ciclos
+
+Cada repositório pode ter vários bastões ao mesmo tempo. Cada ciclo tem um nome (`--slug`), a branch `ai/<slug>` e um worktree próprio em `<repo>/.worktrees/<slug>`, criado pelo `init`. As IAs de um ciclo trabalham só nesse worktree; a pasta principal fica com você.
+
+```powershell
+bastao init --task="Exportar CSV" --slug=exportar-csv --spec=docs/spec.md --plan=docs/plan.md
+bastao status --todos                           # todos os ciclos de todos os repositórios
+bastao pass --from=claude --to=gemini --action=implement --ciclo=exportar-csv
+bastao fim --ciclo=exportar-csv                 # depois do merge: remove o worktree limpo
+```
+
+- Dentro de `.worktrees/<slug>` o ciclo é deduzido. Na pasta principal, `pass`/`ask`/`wait`/`fim` exigem `--ciclo`.
+- O `pass` acorda o Gemini na hora; o vigia do Gemini exige `--wake=<id>`. Dono do bastão sem atividade por 15 min (`--parado-min`): o Gemini é reacordado uma vez e, persistindo, você é avisado e o `status` mostra PARADO. `BASTAO_REWAKE=off` desliga o reenvio.
+- Ciclos antigos em `.agents/turn.json` seguem funcionando até o `fim`.
+- Faça vitest, eslint e tsconfig de cada repositório ignorarem `.worktrees/**`; senão testes e lint da pasta principal leem os worktrees. O `init` avisa quando falta.
 
 ## Testes
 
 ```powershell
-node --test test.mjs
+node --test test.mjs ciclos.test.mjs parada.test.mjs
 ```
 
 ## Licença

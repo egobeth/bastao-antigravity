@@ -356,6 +356,7 @@ function setupFakeAgentApi() {
   const scriptPath = path.join(tmpDir, 'fake-agentapi.mjs');
   const logPath = path.join(tmpDir, 'fake.log');
   fs.writeFileSync(scriptPath, `import fs from 'node:fs';
+if (process.env.FAKE_SLEEP_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_SLEEP_MS));
 const log = process.env.FAKE_LOG;
 if (log) {
   fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + '\\n', 'utf8');
@@ -420,7 +421,9 @@ test('wait: vez do claude, pass para gemini acorda via wake sem caracteres proib
   });
 
   await new Promise(r => setTimeout(r, 200));
-  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
+  // O vigia registra a conversa; quem acorda é o pass (o vigia não reenvia).
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo,
+    { BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath });
 
   const code = await new Promise(resolve => waitProc.on('close', resolve));
 
@@ -1201,4 +1204,90 @@ test('fim no legado apaga turn.json', () => {
   const res = runCli(['fim', `--repo=${repo}`], repo);
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
   assert.ok(!fs.existsSync(turn));
+});
+
+// --- Correções da revisão final ---
+
+test('wake lento não apaga um pass feito enquanto o agentapi roda', async () => {
+  const { repo, file } = cicloComGemini('lento', 'conv-l');
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const env = { ...process.env, BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, FAKE_SLEEP_MS: '1500' };
+  const lento = spawn(process.execPath, [BASTAO_CLI, 'pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=lento'],
+    { cwd: repo, env });
+  await new Promise(r => setTimeout(r, 700));
+  const volta = runCli(['pass', '--from=gemini', '--to=claude', '--action=review', `--repo=${repo}`, '--ciclo=lento'], repo);
+  assert.equal(volta.status, 0, `stderr: ${volta.stderr}`);
+  await new Promise(resolve => lento.on('close', resolve));
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(st.current_turn, 'claude', 'o pass do gemini continua valendo');
+  assert.equal(st.action, 'review');
+  assert.deepEqual(st.history.filter(h => h.from !== 'bastao').map(h => `${h.from}>${h.to}`), ['claude>gemini', 'gemini>claude']);
+});
+
+test('vigia do gemini não manda segundo wake enquanto o pass ainda está enviando', async () => {
+  const { repo } = cicloComGemini('duplo', 'conv-d');
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const env = { ...process.env, BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, FAKE_SLEEP_MS: '1200', BASTAO_POLL_MS: '50' };
+  const vigia = spawn(process.execPath, [BASTAO_CLI, 'wait', '--for=gemini', '--wake=conv-d', `--repo=${repo}`, '--ciclo=duplo'], { cwd: repo, env });
+  await new Promise(r => setTimeout(r, 400));
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=duplo'], repo, env);
+  assert.equal(await new Promise(resolve => vigia.on('close', resolve)), 0);
+  assert.equal(fs.readFileSync(logPath, 'utf8').trim().split('\n').length, 1);
+});
+
+test('fim rodado de dentro do worktree recusa sem remover nada', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=f', '--slug=dentro', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const sub = path.join(repo, '.worktrees', 'dentro', 'src');
+  fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(repo, '.worktrees', 'dentro', '.gitignore'), 'src/\n');
+  git(path.join(repo, '.worktrees', 'dentro'), 'add', '.gitignore');
+  git(path.join(repo, '.worktrees', 'dentro'), 'commit', '-m', 'ignore');
+  const res = runCli(['fim'], sub);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /pasta principal/);
+  assert.ok(fs.existsSync(path.join(repo, '.agents', 'ciclos', 'dentro.json')));
+  assert.equal(git(sub, 'rev-parse', '--show-toplevel').stdout.trim(), git(path.join(repo, '.worktrees', 'dentro'), 'rev-parse', '--show-toplevel').stdout.trim());
+});
+
+test('fim conclui um worktree meio removido e aponta a pasta que sobrou', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=f', '--slug=meio', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const wt = path.join(repo, '.worktrees', 'meio');
+  git(repo, 'worktree', 'remove', wt);
+  fs.mkdirSync(wt);
+  fs.writeFileSync(path.join(wt, 'sobra.txt'), 'x');
+  const res = runCli(['fim', `--repo=${repo}`, '--ciclo=meio'], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.ok(!fs.existsSync(path.join(repo, '.agents', 'ciclos', 'meio.json')));
+  assert.ok(fs.existsSync(path.join(wt, 'sobra.txt')), 'não apaga o que não é worktree');
+  assert.ok(res.stdout.includes(wt));
+});
+
+test('init recusa .worktrees/<slug> que existe mas não é o worktree do ciclo', () => {
+  const repo = tempRepo();
+  const wt = path.join(repo, '.worktrees', 'falso');
+  fs.mkdirSync(wt, { recursive: true });
+  fs.writeFileSync(path.join(wt, 'x.txt'), 'x');
+  const res = runCli(['init', '--task=f', '--slug=falso', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /não é o worktree/);
+  assert.ok(!fs.existsSync(path.join(repo, '.agents', 'ciclos', 'falso.json')));
+});
+
+test('pass limpa a parada anterior e done não mostra PARADO', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=s', '--slug=stall', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const file = path.join(repo, '.agents', 'ciclos', 'stall.json');
+  runCli(['pass', '--from=claude', '--to=codex', '--action=implement', `--repo=${repo}`, '--ciclo=stall'], repo,
+    { BASTAO_CODEX: path.join(ROOT, 'nao-existe.exe') });
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  st.status = 'IN_PROGRESS';
+  st.current_turn = 'codex';
+  st.stall = { since: new Date(0).toISOString(), rewake_at: null, notified_at: new Date(0).toISOString() };
+  fs.writeFileSync(file, JSON.stringify(st));
+  const res = runCli(['pass', '--from=codex', '--to=human', '--action=done', `--repo=${repo}`, '--ciclo=stall'], repo);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).stall, null);
+  assert.doesNotMatch(runCli(['status', `--repo=${repo}`, '--ciclo=stall'], repo).stdout, /PARADO/);
 });

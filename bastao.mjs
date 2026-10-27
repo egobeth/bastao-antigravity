@@ -157,6 +157,7 @@ export function applyPass(state, {
 
   const s = JSON.parse(JSON.stringify(state));
   s.seq = (state.seq ?? 0) + 1;
+  s.stall = null; // passagem nova, contagem de parada nova
   s.current_turn = newTurn;
   s.status = newStatus;
   s.round = newRound;
@@ -202,6 +203,7 @@ export function applyAsk(state, { from, question }, now = new Date().toISOString
 
   const s = JSON.parse(JSON.stringify(state));
   s.seq = (state.seq ?? 0) + 1;
+  s.stall = null; // passagem nova, contagem de parada nova
   s.status = 'WAITING_HUMAN';
   s.ask_human = { from, question, at: now };
   s.history.push({
@@ -221,6 +223,7 @@ export function applyAsk(state, { from, question }, now = new Date().toISOString
 export function applyPause(state, now = new Date().toISOString()) {
   const s = JSON.parse(JSON.stringify(state));
   s.seq = (state.seq ?? 0) + 1;
+  s.stall = null; // passagem nova, contagem de parada nova
   s.status = 'MANUAL_PAUSE';
   s.current_turn = 'human';
   s.history.push({
@@ -281,16 +284,29 @@ export function writeState(file, state) {
   fs.renameSync(tmpPath, file);
 }
 
-// Cria .worktrees/<slug> na branch ai/<slug>; reaproveita a pasta ou a branch se já existirem.
+export function worktreeList(mainRepo) {
+  const out = spawnSync('git', ['worktree', 'list', '--porcelain'], { cwd: mainRepo, encoding: 'utf8' }).stdout || '';
+  return out.split(/\r?\n\r?\n/).filter(Boolean).map(bloco => {
+    const linhas = bloco.split(/\r?\n/);
+    const branch = linhas.find(l => l.startsWith('branch ')) || '';
+    return { path: path.normalize(linhas[0].replace(/^worktree /, '')), branch: branch.replace(/^branch refs\/heads\//, '') };
+  });
+}
+
+const samePath = (a, b) => path.normalize(a).toLowerCase() === path.normalize(b).toLowerCase();
+
+// Cria .worktrees/<slug> na branch ai/<slug>; reaproveita o worktree ou a branch se já existirem.
 export function ensureWorktree(mainRepo, slug, base) {
   const wt = path.join(mainRepo, '.worktrees', slug);
-  if (fs.existsSync(wt)) return wt;
   const branch = `ai/${slug}`;
-  const list = spawnSync('git', ['worktree', 'list', '--porcelain'], { cwd: mainRepo, encoding: 'utf8' }).stdout || '';
-  const emUso = list.split(/\r?\n\r?\n/).find(b => b.split(/\r?\n/).includes(`branch refs/heads/${branch}`));
+  const list = worktreeList(mainRepo);
+  if (fs.existsSync(wt)) {
+    if (list.some(w => samePath(w.path, wt) && w.branch === branch)) return wt;
+    throw new BastaoError(`A pasta ${wt} existe mas não é o worktree de ${branch}; apague-a ou use outro --slug`, 'WORKTREE');
+  }
+  const emUso = list.find(w => w.branch === branch);
   if (emUso) {
-    const onde = emUso.split(/\r?\n/)[0].replace(/^worktree /, '');
-    throw new BastaoError(`A branch ${branch} já está em uso em ${path.normalize(onde)}; troque de branch lá ou use outro --slug`, 'WORKTREE');
+    throw new BastaoError(`A branch ${branch} já está em uso em ${emUso.path}; troque de branch lá ou use outro --slug`, 'WORKTREE');
   }
   const exists = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: mainRepo }).status === 0;
   const args = exists ? ['worktree', 'add', wt, branch] : ['worktree', 'add', '-b', branch, wt, base || 'HEAD'];
@@ -326,14 +342,17 @@ export function ensureExclude(repo) {
 export function sendAgentApiMessage(wakeId, text) {
   const bin = process.env.BASTAO_AGENTAPI
     || path.join(process.env.USERPROFILE || '', '.gemini', 'antigravity-ide', 'bin', 'agentapi.bat');
+  // Um agentapi travado não pode segurar o pass nem o vigia.
+  const timeout = 15000;
   if (bin.endsWith('.mjs')) {
-    return spawnSync(process.execPath, [bin, 'send-message', '--title=Bastao', wakeId, text], { windowsHide: true }).status === 0;
+    return spawnSync(process.execPath, [bin, 'send-message', '--title=Bastao', wakeId, text], { windowsHide: true, timeout }).status === 0;
   }
   // cmd /s /c remove o primeiro e o último ", por isso a linha inteira vai entre aspas e sem o escape do libuv.
   // wakeId é validado no wait e o texto é fixo (sem & | < > ^ " %).
   const res = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${bin}" send-message --title=Bastao ${wakeId} "${text}""`], {
     windowsHide: true,
-    windowsVerbatimArguments: true
+    windowsVerbatimArguments: true,
+    timeout
   });
   return res.status === 0;
 }
@@ -348,14 +367,28 @@ export function wakeText(state, { repoName = '', worktreeAbs = null, rewake = fa
     + (rewake ? ' Se ja estiver trabalhando, ignore.' : '');
 }
 
+// Relê o estado e grava fn(estado) só se ninguém passou o bastão desde a passagem `seq`.
+export async function mergeState(file, seq, fn) {
+  const cur = await readState(file);
+  if (!cur || cur.seq !== seq) return false;
+  writeState(file, fn(cur));
+  return true;
+}
+
+// O pass grava wake.ok = null antes de enviar; o vigia não manda outro enquanto o envio é recente.
+export function wakeHandled(state, now = Date.now()) {
+  const w = state.wake;
+  return w?.seq === state.seq && (w.ok === true || (w.ok === null && now - Date.parse(w.at) < 60000));
+}
+
 // Envia a mensagem de acordar à conversa registrada do Gemini e grava o resultado no estado.
-export function wakeGemini(file, state, opts) {
+export async function wakeGemini(file, state, opts) {
   const at = new Date().toISOString();
   const ok = sendAgentApiMessage(state.conversations.gemini, wakeText(state, opts));
-  writeState(file, {
-    ...state,
+  await mergeState(file, state.seq, cur => ({
+    ...cur,
     wake: { seq: state.seq, at, ok },
-    history: [...(state.history || []), {
+    history: [...(cur.history || []), {
       at,
       from: 'bastao',
       to: 'gemini',
@@ -364,7 +397,7 @@ export function wakeGemini(file, state, opts) {
       notes: opts?.rewake ? 'reacordar' : 'acordar',
       evidence: null
     }]
-  });
+  }));
   return ok;
 }
 
@@ -639,7 +672,7 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     const next = { ...cur, stall };
     writeState(cycle.paths.state, next);
     if (action === 'rewake') {
-      wakeGemini(cycle.paths.state, next, { repoName, worktreeAbs: cycle.paths.worktree, rewake: true });
+      await wakeGemini(cycle.paths.state, next, { repoName, worktreeAbs: cycle.paths.worktree, rewake: true });
     } else if (action === 'notify') {
       const min = Math.round((Date.now() - activityMs) / 60000);
       avisar(`[PARADO] ${state.slug}: ${state.current_turn} sem atividade há ${min} min`);
@@ -775,14 +808,19 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       force: values.force || false
     });
     if (Number(values['parado-min']) > 0) nextState.parado_min = Number(values['parado-min']);
+    const acordarGemini = nextState.current_turn === 'gemini' && nextState.status === 'IN_PROGRESS';
+    // Marca o envio antes de enviar, para o vigia do Gemini não mandar outro ao mesmo tempo.
+    if (acordarGemini && nextState.conversations?.gemini) {
+      nextState.wake = { seq: nextState.seq, at: new Date().toISOString(), ok: null };
+    }
 
     writeState(file, nextState);
     if (notifyMsg) avisar(notifyMsg);
     console.log(`bastao: bastão passado para ${nextState.current_turn} (${nextState.action})`);
 
-    if (nextState.current_turn === 'gemini' && nextState.status === 'IN_PROGRESS') {
+    if (acordarGemini) {
       const woke = !!nextState.conversations?.gemini
-        && wakeGemini(file, nextState, { repoName, worktreeAbs: cycle.paths.worktree });
+        && await wakeGemini(file, nextState, { repoName, worktreeAbs: cycle.paths.worktree });
       if (!woke) {
         const msg = `[BASTAO] ${nextState.slug}: vez do gemini, mas não consigo acordá-lo. `
           + `Abra o Gemini em ${cycle.paths.worktree || mainRepo} e diga "retome o bastão ${nextState.slug}".`;
@@ -936,12 +974,8 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       const wakeId = values.wake;
       if (wakeId) {
         const state = await readState(file);
-        if (state) {
-          state.conversations = state.conversations || {};
-          if (state.conversations.gemini !== wakeId) {
-            state.conversations.gemini = wakeId;
-            writeState(file, state);
-          }
+        if (state && state.conversations?.gemini !== wakeId) {
+          await mergeState(file, state.seq, cur => ({ ...cur, conversations: { ...cur.conversations, gemini: wakeId } }));
         }
       }
 
@@ -975,9 +1009,8 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
 
         if (state && state.current_turn === forAgent && state.status === 'IN_PROGRESS') {
           // O pass já acordou o Gemini nesta passagem: o vigia é só reserva.
-          const jaAcordado = state.wake?.seq === state.seq && state.wake.ok;
-          if (wakeId && !jaAcordado) {
-            if (!wakeGemini(file, state, { repoName, worktreeAbs: cycle.paths.worktree })) {
+          if (wakeId && !wakeHandled(state)) {
+            if (!(await wakeGemini(file, state, { repoName, worktreeAbs: cycle.paths.worktree }))) {
               avisar(`[FALHA] ${state.slug}: falha ao acordar ${forAgent}`);
               cleanLock();
               process.exit(5);
@@ -1012,17 +1045,29 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       throw new BastaoError(`Há vigia ativo neste ciclo (${vivos.join(', ')}); encerre-o antes de rodar fim`, 'ACTIVE_WATCHER');
     }
     const wt = cycle.paths.worktree;
-    if (wt && fs.existsSync(wt)) {
-      const sujo = spawnSync('git', ['status', '--porcelain'], { cwd: wt, encoding: 'utf8' }).stdout.trim();
-      if (sujo) throw new BastaoError(`O worktree ${wt} tem alterações não commitadas:\n${sujo}`, 'DIRTY_WORKTREE');
-      const res = spawnSync('git', ['worktree', 'remove', wt], { cwd: mainRepo, encoding: 'utf8' });
-      if (res.status !== 0) {
-        throw new BastaoError(`Não foi possível remover o worktree ${wt}: ${(res.stderr || res.stdout || '').trim()}`, 'WORKTREE');
+    if (wt) {
+      // No Windows, git não apaga a pasta em que o próprio processo está: o worktree ficaria meio removido.
+      const rel = path.relative(wt, process.cwd());
+      if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+        throw new BastaoError(`Rode o fim da pasta principal: bastao fim --ciclo=${cycle.slug} --repo=${mainRepo}`, 'INVALID_ARGS');
+      }
+      const registrado = () => worktreeList(mainRepo).some(w => samePath(w.path, wt));
+      if (registrado()) {
+        const st = spawnSync('git', ['status', '--porcelain'], { cwd: wt, encoding: 'utf8' });
+        if (st.status !== 0) throw new BastaoError(`Não foi possível ler o estado do worktree ${wt}: ${(st.stderr || '').trim()}`, 'WORKTREE');
+        if (st.stdout.trim()) throw new BastaoError(`O worktree ${wt} tem alterações não commitadas:\n${st.stdout.trim()}`, 'DIRTY_WORKTREE');
+        const res = spawnSync('git', ['worktree', 'remove', wt], { cwd: mainRepo, encoding: 'utf8' });
+        if (res.status !== 0 && registrado()) {
+          throw new BastaoError(`Não foi possível remover o worktree ${wt}: ${(res.stderr || res.stdout || '').trim()}`, 'WORKTREE');
+        }
       }
     }
     fs.rmSync(cycle.paths.state, { force: true });
     removeFromIndex(mainRepo, cycle.slug);
     console.log(`bastao: ciclo '${cycle.slug}' encerrado${wt ? '; worktree removido' : ''}; a branch ai/${cycle.slug} foi mantida`);
+    if (wt && fs.existsSync(wt)) {
+      console.log(`Aviso: a pasta ${wt} sobrou e não é mais um worktree; feche o que a estiver usando e apague-a à mão.`);
+    }
     return;
   }
 

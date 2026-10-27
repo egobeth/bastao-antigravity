@@ -50,4 +50,5 @@ export function decideStall(state, { now, activityMs, canRewake }) {
   return { action: 'none', stall };
 }
 
-export const isParado = state => !!state.stall?.notified_at;
+export const isParado = state =>
+  state.status === 'IN_PROGRESS' && state.current_turn !== 'human' && !!state.stall?.notified_at;

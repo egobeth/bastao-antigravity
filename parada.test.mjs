@@ -92,3 +92,9 @@ test('lastActivity: eventos do próprio bastão (acordar) não contam como ativi
   ] };
   assert.equal(lastActivity({ dir: repo, branch, state }), passou);
 });
+
+test("isParado ignora ciclo terminal ou com human", () => {
+  const stall = { since: iso(T0), rewake_at: null, notified_at: iso(T0) };
+  assert.equal(isParado(base({ stall, status: "APPROVED", current_turn: "human" })), false);
+  assert.equal(isParado(base({ stall, current_turn: "human" })), false);
+});

@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { BastaoError } from './erro.mjs';
 import { SLUG_RE, mainRepoOf, toplevelOf, cyclePaths, listCycles, resolveCycle, addToIndex } from './ciclos.mjs';
+import { lastActivity, decideStall, isParado } from './parada.mjs';
 
 export { BastaoError };
 
@@ -564,6 +565,46 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
   const instr = (state, cycle) => formatInstructions(state, { repoName, worktreeAbs: cycle.paths.worktree });
   // Toda notificação vira '[TAG] <repo>/<slug> ...'.
   const avisar = msg => notify(msg.replace(/^(\[[^\]]+\]) /, `$1 ${repoName}/`));
+  const atividade = (state, cycle) => lastActivity({ dir: cycle.paths.worktree || mainRepo, branch: state.branch, state });
+
+  // Rodado pelos vigias: reacorda o Gemini parado uma vez e, persistindo, avisa o usuário (uma vez por parada).
+  const checarParada = async cycle => {
+    const state = await readState(cycle.paths.state);
+    if (!state) return;
+    const canRewake = state.current_turn === 'gemini' && !!state.conversations?.gemini && process.env.BASTAO_REWAKE !== 'off';
+    const activityMs = atividade(state, cycle);
+    const { action, stall } = decideStall(state, { now: Date.now(), activityMs, canRewake });
+    if (action === 'none') return;
+    // Só grava se ninguém passou o bastão enquanto calculávamos.
+    const cur = await readState(cycle.paths.state);
+    if (!cur || cur.seq !== state.seq) return;
+    const next = { ...cur, stall };
+    writeState(cycle.paths.state, next);
+    if (action === 'rewake') {
+      wakeGemini(cycle.paths.state, next, { repoName, worktreeAbs: cycle.paths.worktree, rewake: true });
+    } else if (action === 'notify') {
+      const min = Math.round((Date.now() - activityMs) / 60000);
+      avisar(`[PARADO] ${state.slug}: ${state.current_turn} sem atividade há ${min} min`);
+    }
+  };
+
+  // Linhas de situação do status: há quanto tempo, vigias, se dá para acordar o dono e PARADO.
+  const situacao = (state, cycle) => {
+    const vivos = ['claude', 'gemini', 'codex'].filter(a => isLockAlive(cycle.paths.lock(a)));
+    const dono = state.current_turn;
+    const acordavel = dono === 'gemini' ? !!state.conversations?.gemini
+      : dono === 'claude' ? vivos.includes('claude')
+        : dono === 'codex';
+    const activityMs = atividade(state, cycle);
+    const parado = isParado(state)
+      || (vivos.length === 0 && state.status === 'IN_PROGRESS' && dono !== 'human' && Date.now() - activityMs >= state.parado_min * 60000);
+    return [
+      `Com ${dono} há ${Math.round((Date.now() - activityMs) / 60000)} min`,
+      `Vigias: ${vivos.join(', ') || 'nenhum'}`,
+      `Acordável: ${acordavel ? 'sim' : 'não'}`,
+      ...(parado ? ['PARADO: sem atividade além do limite; veja o dono do bastão'] : [])
+    ];
+  };
 
   if (command === 'init') {
     const { values } = parseArgs({
@@ -647,6 +688,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
         evidence: { type: 'string' },
         skills: { type: 'string' },
         roles: { type: 'string' },
+        'parado-min': { type: 'string' },
         force: { type: 'boolean', default: false },
         repo: { type: 'string' },
         ciclo: { type: 'string' }
@@ -682,6 +724,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       roles: values.roles || null,
       force: values.force || false
     });
+    if (Number(values['parado-min']) > 0) nextState.parado_min = Number(values['parado-min']);
 
     writeState(file, nextState);
     if (notifyMsg) avisar(notifyMsg);
@@ -776,6 +819,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     const state = await readState(cycle.paths.state);
 
     console.log(instr(state, cycle));
+    for (const linha of situacao(state, cycle)) console.log(linha);
     console.log('\nHistórico recente:');
     const recent = (state.history || []).slice(-5);
     if (recent.length === 0) {
@@ -855,11 +899,18 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
       const timeoutMin = Number(values['timeout-min']) || 240;
       const timeoutMs = timeoutMin * 60 * 1000;
       const startTime = Date.now();
+      const stallEvery = Number(process.env.BASTAO_STALL_CHECK_MS) || 60000;
+      let nextStallCheck = Date.now() + stallEvery;
 
       while (true) {
         try {
           fs.utimesSync(lockPath, new Date(), new Date());
         } catch {}
+
+        if (Date.now() >= nextStallCheck) {
+          nextStallCheck = Date.now() + stallEvery;
+          await checarParada(cycle);
+        }
 
         const state = await readState(file);
 

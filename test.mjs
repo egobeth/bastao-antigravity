@@ -1064,3 +1064,53 @@ test('wait --for=gemini sem --wake falha', () => {
   assert.equal(res.status, 1);
   assert.match(res.stderr, /--wake/);
 });
+
+// --- Multiciclo: detector de parada ---
+
+test('vigia do claude reacorda o gemini parado uma vez e depois avisa; status mostra PARADO', async () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=p', '--slug=parado', '--spec=s', '--plan=p', '--parado-min=0.01', `--repo=${repo}`], repo);
+  const file = path.join(repo, '.agents', 'ciclos', 'parado.json');
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  st.conversations.gemini = 'conv-p';
+  fs.writeFileSync(file, JSON.stringify(st));
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const aviso = path.join(ROOT, `aviso-parado-${Date.now()}.log`);
+  const env = {
+    ...process.env, BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, BASTAO_NOTIFY: aviso,
+    BASTAO_POLL_MS: '50', BASTAO_STALL_CHECK_MS: '100'
+  };
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=parado'], repo, env);
+
+  const vigia = spawn(process.execPath, [BASTAO_CLI, 'wait', '--for=claude', '--timeout-min=0.05', `--repo=${repo}`, '--ciclo=parado'],
+    { cwd: repo, env });
+  const code = await new Promise(resolve => vigia.on('close', resolve));
+  assert.equal(code, 2, 'termina por tempo esgotado');
+
+  const msgs = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(l => JSON.parse(l)[3]);
+  assert.equal(msgs.length, 2, msgs.join('\n'));
+  assert.doesNotMatch(msgs[0], /ignore/);
+  assert.match(msgs[1], /Se ja estiver trabalhando, ignore\./);
+
+  const final = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.ok(final.stall?.rewake_at);
+  assert.ok(final.stall?.notified_at);
+  const avisos = fs.readFileSync(aviso, 'utf8').trim().split('\n').filter(l => l.includes('[PARADO]'));
+  assert.equal(avisos.length, 1);
+  assert.match(avisos[0], /\[PARADO\] pasta com espaço é\/parado: gemini sem atividade/);
+
+  const status = runCli(['status', `--repo=${repo}`, '--ciclo=parado'], repo);
+  assert.match(status.stdout, /PARADO/);
+  assert.match(status.stdout, /Com gemini há \d+ min/);
+  assert.match(status.stdout, /Acordável: sim/);
+  assert.match(status.stdout, /Vigias: nenhum/);
+});
+
+test('pass aceita --parado-min e grava no estado', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=p', '--slug=pm', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const res = runCli(['pass', '--from=claude', '--to=codex', '--action=implement', '--parado-min=40', `--repo=${repo}`, '--ciclo=pm'], repo,
+    { BASTAO_CODEX: path.join(ROOT, 'nao-existe.exe') });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'pm.json'), 'utf8')).parado_min, 40);
+});

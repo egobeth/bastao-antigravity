@@ -334,6 +334,36 @@ export function sendAgentApiMessage(wakeId, text) {
   return res.status === 0;
 }
 
+const CMD_UNSAFE = /[^\x20-\x7e]|[&|<>^"%]/;
+
+// O texto vai pela linha de comando do cmd: só ASCII e sem & | < > ^ " %. Caminho inseguro é omitido.
+export function wakeText(state, { repoName = '', worktreeAbs = null, rewake = false } = {}) {
+  const repo = repoName.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(new RegExp(CMD_UNSAFE, 'g'), '');
+  const ws = worktreeAbs && !CMD_UNSAFE.test(worktreeAbs) ? ` Workspace: ${worktreeAbs}.` : '';
+  return `Bastao: sua vez no ciclo ${state.slug} (${repo}).${ws} Rode: bastao status --ciclo=${state.slug} e siga a skill bastao.`
+    + (rewake ? ' Se ja estiver trabalhando, ignore.' : '');
+}
+
+// Envia a mensagem de acordar à conversa registrada do Gemini e grava o resultado no estado.
+export function wakeGemini(file, state, opts) {
+  const at = new Date().toISOString();
+  const ok = sendAgentApiMessage(state.conversations.gemini, wakeText(state, opts));
+  writeState(file, {
+    ...state,
+    wake: { seq: state.seq, at, ok },
+    history: [...(state.history || []), {
+      at,
+      from: 'bastao',
+      to: 'gemini',
+      action: ok ? 'wake' : 'wake_failed',
+      round: state.round,
+      notes: opts?.rewake ? 'reacordar' : 'acordar',
+      evidence: null
+    }]
+  });
+  return ok;
+}
+
 export function isLockAlive(lockPath) {
   if (!fs.existsSync(lockPath)) return false;
   try {
@@ -387,7 +417,12 @@ export function findCodex() {
 }
 
 export function notify(text) {
-  if (process.env.BASTAO_NOTIFY === 'off') return;
+  const dest = process.env.BASTAO_NOTIFY;
+  if (dest === 'off') return;
+  if (dest?.endsWith('.log')) {
+    fs.appendFileSync(dest, text + '\n', 'utf8');
+    return;
+  }
   const username = process.env.USERNAME || process.env.USER || '';
   if (username) {
     const res = spawnSync('msg', [username, '/TIME:0', text], {
@@ -528,7 +563,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
   const resolve = explicitRequired => resolveCycle({ mainRepo, toplevel, ciclo: flag('ciclo'), explicitRequired });
   const instr = (state, cycle) => formatInstructions(state, { repoName, worktreeAbs: cycle.paths.worktree });
   // Toda notificação vira '[TAG] <repo>/<slug> ...'.
-  const avisar = msg => notify(msg.replace(/^([[^]]+]) /, `$1 ${repoName}/`));
+  const avisar = msg => notify(msg.replace(/^(\[[^\]]+\]) /, `$1 ${repoName}/`));
 
   if (command === 'init') {
     const { values } = parseArgs({
@@ -652,6 +687,17 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     if (notifyMsg) avisar(notifyMsg);
     console.log(`bastao: bastão passado para ${nextState.current_turn} (${nextState.action})`);
 
+    if (nextState.current_turn === 'gemini' && nextState.status === 'IN_PROGRESS') {
+      const woke = !!nextState.conversations?.gemini
+        && wakeGemini(file, nextState, { repoName, worktreeAbs: cycle.paths.worktree });
+      if (!woke) {
+        const msg = `[BASTAO] ${nextState.slug}: vez do gemini, mas não consigo acordá-lo. `
+          + `Abra o Gemini em ${cycle.paths.worktree || mainRepo} e diga "retome o bastão ${nextState.slug}".`;
+        avisar(msg);
+        console.log(`bastao: ${msg.slice('[BASTAO] '.length)}`);
+      }
+    }
+
     if (nextState.current_turn === 'codex' && nextState.status === 'IN_PROGRESS') {
       const bastaoScript = fileURLToPath(import.meta.url);
       const child = spawn(process.execPath, [bastaoScript, '_codex', `--repo=${mainRepo}`, `--ciclo=${cycle.slug}`], {
@@ -767,6 +813,9 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
     if (!['claude', 'gemini', 'codex'].includes(forAgent)) {
       throw new BastaoError(`Agente inválido: ${forAgent}`, 'INVALID_ARGS');
     }
+    if (forAgent === 'gemini' && !values.wake) {
+      throw new BastaoError('wait --for=gemini exige --wake=<Conversation ID>; sem ele ninguém acorda o Gemini', 'INVALID_ARGS');
+    }
     if (values.wake && !/^[\w-]+$/.test(values.wake)) {
       throw new BastaoError(`--wake inválido: ${values.wake} (use o Conversation ID)`, 'INVALID_ARGS');
     }
@@ -816,7 +865,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
 
         if (state && ['APPROVED', 'MAX_ROUNDS_REACHED', 'MANUAL_PAUSE'].includes(state.status)) {
           if (wakeId) {
-            sendAgentApiMessage(wakeId, 'Bastao: ciclo finalizado ou pausado. Rode: bastao status  e siga a skill bastao.');
+            sendAgentApiMessage(wakeId, `Bastao: ciclo ${state.slug} finalizado ou pausado. Rode: bastao status --ciclo=${state.slug} e siga a skill bastao.`);
           }
           console.log(`Estado terminal: ${state.status}`);
           cleanLock();
@@ -824,20 +873,10 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
         }
 
         if (state && state.current_turn === forAgent && state.status === 'IN_PROGRESS') {
-          if (wakeId) {
-            const ok = sendAgentApiMessage(wakeId, 'Bastao: sua vez. Rode: bastao status  e siga a skill bastao.');
-            if (!ok) {
-              state.history = state.history || [];
-              state.history.push({
-                at: new Date().toISOString(),
-                from: 'wait',
-                to: forAgent,
-                action: 'wake_failed',
-                round: state.round,
-                notes: `Falha ao acordar ${forAgent}`,
-                evidence: null
-              });
-              writeState(file, state);
+          // O pass já acordou o Gemini nesta passagem: o vigia é só reserva.
+          const jaAcordado = state.wake?.seq === state.seq && state.wake.ok;
+          if (wakeId && !jaAcordado) {
+            if (!wakeGemini(file, state, { repoName, worktreeAbs: cycle.paths.worktree })) {
               avisar(`[FALHA] ${state.slug}: falha ao acordar ${forAgent}`);
               cleanLock();
               process.exit(5);
@@ -850,7 +889,7 @@ Todos aceitam --repo=<dir>. Ciclo já existe? Use 'status' e 'pass', não 'init'
 
         if (Date.now() - startTime >= timeoutMs) {
           if (wakeId) {
-            sendAgentApiMessage(wakeId, 'Bastao: tempo esgotado. Rode o wait de novo conforme a skill bastao.');
+            sendAgentApiMessage(wakeId, `Bastao: tempo esgotado no ciclo ${cycle.slug}. Rode o wait de novo conforme a skill bastao.`);
           }
           console.log('TIMEOUT: rearme o wait');
           cleanLock();

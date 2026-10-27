@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseRoles } from './bastao.mjs';
+import { parseRoles, wakeText } from './bastao.mjs';
 import { BASTAO_CLI, ROOT, runCli, tempRepo, git } from './testutil.mjs';
 
 // Ciclo único do repo de teste (nenhum antes do init).
@@ -380,7 +380,7 @@ test('wait: ja e a vez de gemini sai 0 em menos de 1 s', () => {
   runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
 
   const start = Date.now();
-  const res = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
+  const res = runCli(['wait', '--for=gemini', '--wake=conv-t', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   const elapsed = Date.now() - start;
 
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
@@ -502,21 +502,21 @@ test('wait: lock concorrente sai 4, lock orfao ou antigo e assumido', () => {
   // 1. Simula lock ativo com PID atual e mtime recente
   fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
 
-  const res = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
+  const res = runCli(['wait', '--for=gemini', '--wake=conv-t', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res.status, 4, `Esperado 4 para lock ativo, obteve ${res.status}`);
 
   // 2. Lock com PID inexistente (999999) deve ser assumido
   fs.writeFileSync(lock, JSON.stringify({ pid: 999999, started_at: new Date().toISOString() }), 'utf8');
   // Passa para gemini para sair 0
   runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', ...alvo(repo)], repo);
-  const res2 = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
+  const res2 = runCli(['wait', '--for=gemini', '--wake=conv-t', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res2.status, 0);
 
   // 3. Lock com PID vivo mas heartbeat antigo (> 30s) deve ser assumido
   fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
   const pastTime = new Date(Date.now() - 60000);
   fs.utimesSync(lock, pastTime, pastTime);
-  const res3 = runCli(['wait', '--for=gemini', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
+  const res3 = runCli(['wait', '--for=gemini', '--wake=conv-t', ...alvo(repo)], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(res3.status, 0);
 });
 
@@ -851,7 +851,7 @@ test('wait: agentapi .bat em pasta com espaço recebe id e texto como argumentos
 
   assert.equal(res.status, 0, `stderr: ${res.stderr}`);
   assert.equal(fs.readFileSync(logPath, 'utf8').trim(),
-    'send-message --title=Bastao conv-1 "Bastao: sua vez. Rode: bastao status  e siga a skill bastao."');
+    'send-message --title=Bastao conv-1 "Bastao: sua vez no ciclo t (pasta com espaco e). Rode: bastao status --ciclo=t e siga a skill bastao."');
 });
 
 test('pass e wait recusam agente inválido, flag com typo, wake inválido e repo sem ciclo', () => {
@@ -994,4 +994,73 @@ test('legado: turn.json segue funcionando com lock antigo ao lado de um ciclo no
   fs.writeFileSync(path.join(repo, '.agents', 'wait-claude.lock'), JSON.stringify({ pid: process.pid }));
   const wait = runCli(['wait', '--for=claude', `--repo=${repo}`, '--ciclo=leg'], repo, { BASTAO_POLL_MS: '50' });
   assert.equal(wait.status, 4, 'vigia legado vivo é respeitado');
+});
+
+// --- Multiciclo: acordar o Gemini ---
+
+test('wakeText: texto exato, reacordar e caminho omitido quando não é seguro', () => {
+  const st = { slug: 'w' };
+  assert.equal(wakeText(st, { repoName: 'GESTAO', worktreeAbs: String.raw`C:\r\GESTAO\.worktrees\w` }),
+    String.raw`Bastao: sua vez no ciclo w (GESTAO). Workspace: C:\r\GESTAO\.worktrees\w. Rode: bastao status --ciclo=w e siga a skill bastao.`);
+  assert.equal(wakeText(st, { repoName: 'GESTAO', worktreeAbs: null, rewake: true }),
+    'Bastao: sua vez no ciclo w (GESTAO). Rode: bastao status --ciclo=w e siga a skill bastao. Se ja estiver trabalhando, ignore.');
+  for (const ruim of [String.raw`C:\a&b\.worktrees\w`, String.raw`C:\100%\w`, String.raw`C:\pasta é\w`]) {
+    assert.doesNotMatch(wakeText(st, { repoName: 'R', worktreeAbs: ruim }), /Workspace/);
+  }
+  assert.doesNotMatch(wakeText(st, { repoName: 'Produção & cia' }), /[^\x20-\x7e]|[&|<>^"%]/);
+});
+
+function cicloComGemini(slug, conversa) {
+  const repo = tempRepo();
+  runCli(['init', `--task=${slug}`, `--slug=${slug}`, '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const file = path.join(repo, '.agents', 'ciclos', `${slug}.json`);
+  if (conversa) {
+    const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+    st.conversations.gemini = conversa;
+    fs.writeFileSync(file, JSON.stringify(st));
+  }
+  return { repo, file };
+}
+
+test('pass para gemini com conversa registrada acorda na hora', () => {
+  const { repo, file } = cicloComGemini('w', 'conv-1');
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=w'], repo,
+    { BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const [args] = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.deepEqual(args, ['send-message', '--title=Bastao', 'conv-1',
+    'Bastao: sua vez no ciclo w (pasta com espaco e). Rode: bastao status --ciclo=w e siga a skill bastao.']);
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(st.wake.seq, st.seq);
+  assert.equal(st.wake.ok, true);
+  assert.equal(st.history.at(-1).action, 'wake');
+});
+
+test('pass para gemini sem conversa registrada avisa o usuário', () => {
+  const { repo } = cicloComGemini('semconv', null);
+  const aviso = path.join(ROOT, `aviso-${Date.now()}.log`);
+  const res = runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=semconv'], repo,
+    { BASTAO_NOTIFY: aviso });
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  const texto = fs.readFileSync(aviso, 'utf8');
+  assert.match(texto, /pasta com espaço é\/semconv/);
+  assert.match(texto, /retome o bastão semconv/);
+});
+
+test('vigia do gemini não reenvia na passagem já acordada pelo pass', () => {
+  const { repo } = cicloComGemini('dup', 'conv-1');
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  const env = { BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, BASTAO_POLL_MS: '50' };
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=dup'], repo, env);
+  const res = runCli(['wait', '--for=gemini', '--wake=conv-1', `--repo=${repo}`, '--ciclo=dup'], repo, env);
+  assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+  assert.equal(fs.readFileSync(logPath, 'utf8').trim().split('\n').length, 1);
+});
+
+test('wait --for=gemini sem --wake falha', () => {
+  const { repo } = cicloComGemini('semwake', null);
+  const res = runCli(['wait', '--for=gemini', `--repo=${repo}`, '--ciclo=semwake'], repo, { BASTAO_POLL_MS: '50' });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /--wake/);
 });

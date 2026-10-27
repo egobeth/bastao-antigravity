@@ -12,6 +12,10 @@ after(() => fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5 }));
 // Nenhum teste toca o índice real nem abre notificação do Windows.
 process.env.BASTAO_NOTIFY = 'off';
 process.env.BASTAO_INDEX = path.join(ROOT, 'indice.json');
+// Nenhum teste chama o agentapi real do Antigravity.
+const agentapiNulo = path.join(ROOT, 'agentapi-nulo.mjs');
+fs.writeFileSync(agentapiNulo, 'process.exit(0);\n');
+process.env.BASTAO_AGENTAPI = agentapiNulo;
 
 export function runCli(args, cwd, env = {}) {
   return spawnSync(process.execPath, [BASTAO_CLI, ...args], {

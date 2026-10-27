@@ -39,7 +39,7 @@ O painel do Codex no Antigravity **não** se atualiza com turnos feitos fora del
 - Os turnos rodam sem interface com `codex exec` (sandbox `workspace-write` no seu repositório), retomando a mesma thread do Codex a cada rodada, então ele mantém a memória do ciclo. Passe `--codex-thread=<id>` no `init` para continuar uma thread que você já tem aberta.
 - Tudo que ele imprime é gravado ao vivo em **`.agents/live/<slug>/codex.log`**, com um cabeçalho `=== Round r/m · ação · HH:MM ===` por turno. Acompanhe com:
   ```powershell
-  Get-Content .agents\live\codex.log -Wait
+  Get-Content .agents\live\<slug>\codex.log -Wait
   ```
 - Para ver esses turnos no próprio painel do Codex, rode **Developer: Reload Window** no Antigravity.
 - Se o Codex terminar sem passar o bastão (falha, binário ausente ou simplesmente parou), o ciclo vai para "aguardando humano" com popup, em vez de travar. Responda com:

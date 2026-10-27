@@ -39,7 +39,7 @@ The Codex panel in Antigravity does **not** refresh with turns made from outside
 - Its turns run headless with `codex exec` (sandbox `workspace-write` in your repo), resuming the same Codex thread each round, so it keeps its memory of the cycle. Pass `--codex-thread=<id>` to `init` to continue a thread you already have open.
 - Everything it prints is appended live to **`.agents/live/<slug>/codex.log`**, with a `=== Round r/m · action · HH:MM ===` header per turn. Follow it with:
   ```powershell
-  Get-Content .agents\live\codex.log -Wait
+  Get-Content .agents\live\<slug>\codex.log -Wait
   ```
 - To see those turns in the Codex panel itself, run **Developer: Reload Window** in Antigravity.
 - If Codex exits without passing the baton (crash, missing binary, it simply stopped), the cycle switches to "waiting for human" with a popup instead of hanging. Answer with:

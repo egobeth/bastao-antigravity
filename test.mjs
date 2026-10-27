@@ -1,35 +1,10 @@
-import test, { after } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { parseRoles } from './bastao.mjs';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const BASTAO_CLI = path.join(__dirname, 'bastao.mjs');
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'bastao-teste-'));
-after(() => fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5 }));
-
-process.env.BASTAO_NOTIFY = 'off';
-
-function runCli(args, cwd, env = {}) {
-  return spawnSync(process.execPath, [BASTAO_CLI, ...args], {
-    cwd,
-    encoding: 'utf8',
-    env: { ...process.env, BASTAO_NOTIFY: 'off', ...env }
-  });
-}
-
-function tempRepo() {
-  const base = path.join(ROOT, `bastao-teste-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const repoDir = path.join(base, 'pasta com espaço é');
-  fs.mkdirSync(repoDir, { recursive: true });
-  spawnSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
-  return repoDir;
-}
+import { BASTAO_CLI, ROOT, runCli, tempRepo } from './testutil.mjs';
 
 test('parseRoles extrai implement e review corretamente', () => {
   const roles = parseRoles('implement:codex,review:claude+gemini');

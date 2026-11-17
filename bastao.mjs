@@ -452,6 +452,17 @@ export function isLockAlive(lockPath) {
   }
 }
 
+// O `where codex` de uma instalação npm no Windows lista primeiro `codex` (script sh, sem extensão)
+// e `codex.cmd`: nenhum dos dois o spawn executa sem shell (ENOENT). Usa o codex.js que o shim chama.
+export function codexDoWhere(paths) {
+  for (const p of paths) {
+    if (path.extname(p).toLowerCase() === '.exe') return p;
+    const js = path.join(path.dirname(p), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    if (fs.existsSync(js)) return js;
+  }
+  return paths[0] || null;
+}
+
 export function findCodex() {
   if (process.env.BASTAO_CODEX) {
     return process.env.BASTAO_CODEX;
@@ -459,8 +470,8 @@ export function findCodex() {
 
   const whereRes = spawnSync('where', ['codex'], { encoding: 'utf8' });
   if (whereRes.status === 0 && whereRes.stdout) {
-    const firstPath = whereRes.stdout.trim().split(/\r?\n/)[0].trim();
-    if (firstPath) return firstPath;
+    const achado = codexDoWhere(whereRes.stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean));
+    if (achado) return achado;
   }
 
   const userProfile = process.env.USERPROFILE || '';
@@ -1124,6 +1135,8 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', workDir];
     // No worktree, o .git (objetos e refs) fica na pasta principal: o sandbox precisa liberá-lo para o commit.
     if (cycle.paths.worktree) codexArgs.push('--add-dir', gitCommonDir(mainRepo));
+    // O estado do ciclo também fica na pasta principal: sem isso o `bastao pass` do Codex falha com EPERM.
+    if (cycle.paths.worktree) codexArgs.push('--add-dir', path.dirname(file));
     if (state.conversations?.codex) {
       codexArgs.push('resume', state.conversations.codex);
     }
@@ -1140,12 +1153,11 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     fs.appendFileSync(logPath, separator, 'utf8');
 
     // Qualquer falha (Codex ausente, spawn recusado) cai no applyAsk abaixo em vez de deixar o ciclo preso em codex.
-    // ponytail: um codex.cmd de npm não roda sem shell; se aparecer, aponte BASTAO_CODEX para o .exe.
     let fullOutput = '';
     let exitCode;
     try {
       const codexBin = findCodex();
-      const isNodeScript = codexBin.endsWith('.mjs');
+      const isNodeScript = /\.m?js$/i.test(codexBin);
       const execCmd = isNodeScript ? process.execPath : codexBin;
       const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
 

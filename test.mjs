@@ -653,6 +653,9 @@ test('codex: executa via pass sem thread, captura session id, grava live log', a
   // O .git do worktree fica na pasta principal: sem isso o sandbox não deixa o Codex commitar.
   assert.equal(fakeData.argv[fakeData.argv.indexOf('--add-dir') + 1], path.join(repo, '.git'));
   assert.ok(fakeData.argv.indexOf('--add-dir') < fakeData.argv.indexOf('-'), '--add-dir vem antes do prompt');
+  // O estado do ciclo fica na pasta principal: sem isso o `bastao pass` do Codex falha com EPERM.
+  const dirs = fakeData.argv.flatMap((a, i, all) => (a === '--add-dir' ? [all[i + 1]] : []));
+  assert.ok(dirs.includes(path.join(repo, '.agents', 'ciclos')), `--add-dir do estado: ${dirs}`);
   assert.ok(fakeData.argv.includes('-'));
   assert.ok(fakeData.stdin.includes('Vez de: codex'));
   assert.ok(fakeData.stdin.includes(notesComAcento));
@@ -1422,4 +1425,22 @@ test('init recusa slug igual ao do ciclo legado', () => {
   const res = runCli(['init', '--task=l', '--slug=leg', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
   assert.equal(res.status, 1);
   assert.match(res.stderr, /legado/);
+});
+
+test('codexDoWhere: shim do npm no Windows vira o codex.js; .exe direto é mantido', async () => {
+  const { codexDoWhere } = await import('./bastao.mjs');
+  const npm = fs.mkdtempSync(path.join(ROOT, '.tmp-npm-'));
+  try {
+    const js = path.join(npm, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    fs.mkdirSync(path.dirname(js), { recursive: true });
+    fs.writeFileSync(js, '');
+    // ordem do `where codex`: primeiro o script sem extensão, que o spawn não executa (ENOENT)
+    assert.equal(codexDoWhere([path.join(npm, 'codex'), path.join(npm, 'codex.cmd')]), js);
+    assert.equal(codexDoWhere([path.join(npm, 'codex.cmd')]), js);
+    assert.equal(codexDoWhere(['C:/x/codex.exe', path.join(npm, 'codex')]), 'C:/x/codex.exe');
+    assert.equal(codexDoWhere(['/usr/local/bin/codex']), '/usr/local/bin/codex');
+    assert.equal(codexDoWhere([]), null);
+  } finally {
+    fs.rmSync(npm, { recursive: true, force: true });
+  }
 });

@@ -39,6 +39,7 @@ Protocolo de passagem de turno e handoff conversacional contínuo entre Claude C
 ### Codex
 - **Nunca arma vigia.** O Codex é acionado diretamente pelo comando `bastao pass --to=codex` e roda no worktree do ciclo; encerra sua execução assim que passar o bastão.
 - A saída do Codex fica em `.agents/live/<slug>/codex.log`, com um separador `=== Round r/m · <ação> · HH:MM ===` por turno.
+- **Depois de todo `pass --to=codex`, reconfira que a rodada abriu e segue em execução.** Em até ~30 s o `codex.log` precisa ganhar o separador `=== Round <r>/<m> · <ação> ===` da rodada nova, e o arquivo deve continuar crescendo enquanto o `status` diz `Vez de: codex`. O processo do Codex é disparado em segundo plano pelo `pass` e pode morrer junto com o terminal que rodou o comando (visto em 18/11/2026: ciclo 9 min em `codex` sem nenhuma rodada aberta). Se o separador não aparecer, ou o log parar de crescer por vários minutos sem o bastão voltar, relance a rodada num processo que sobreviva ao terminal (no Claude Code, `run_in_background`): `node $env:USERPROFILE\.agents\bastao\bastao.mjs _codex --repo=<pasta principal> --ciclo=<slug>`. O `_codex` não faz nada se não for a vez do Codex, então relançar é seguro; avise o usuário que relançou.
 - Se o Codex terminar sem passar o bastão, o ciclo vai para `WAITING_HUMAN` com a pergunta automática. Para responder, qualquer IA no chat roda, a pedido do usuário:
   `bastao pass --from=human --to=codex --action=<ação> --force --ciclo=<slug> --notes="<resposta do usuário>"`
 

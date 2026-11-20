@@ -42,7 +42,7 @@ The Codex panel in Antigravity does **not** refresh with turns made from outside
   Get-Content .agents\live\<slug>\codex.log -Wait
   ```
 - To see those turns in the Codex panel itself, run **Developer: Reload Window** in Antigravity.
-- If Codex exits without passing the baton (crash, missing binary, it simply stopped), the cycle switches to "waiting for human" with a popup instead of hanging. Answer with:
+- If Codex exits without passing the baton (crash, missing binary, it simply stopped), it first performs **1 automatic retry** via `resume` (when a session id exists); only if it still doesn't pass the baton does the cycle switch to "waiting for human" with a popup instead of hanging. While Codex runs, `_codex` keeps a heartbeat lock (`.agents/ciclos/<slug>.wait-codex.lock`), active watchers (`bastao wait`) re-launch it if its parent shell closed early, and writes to `codex.log` count as activity. Answer a `WAITING_HUMAN` popup with:
   `bastao pass --from=human --to=codex --action=<action> --force --notes="<your answer>"`
 
 ## Requirements
@@ -100,7 +100,7 @@ bastao fim --ciclo=csv-export                   # after the merge: removes the c
 ```
 
 - Inside `.worktrees/<slug>` the cycle is inferred. In the main folder, `pass`/`ask`/`wait`/`fim` require `--ciclo`.
-- `pass` wakes Gemini right away; Gemini's watcher, run in an Antigravity terminal, reads its conversation id from `ANTIGRAVITY_CONVERSATION_ID` and stores Antigravity's address and token in `%USERPROFILE%\.agents\bastao-antigravity.json` so Claude and Codex can wake it too (outside Antigravity, pass `--wake=<id>`). If the baton holder shows no activity for 15 min (`--parado-min`), Gemini is re-woken once and, if still idle, you are notified and `status` shows PARADO. `BASTAO_REWAKE=off` disables the re-wake.
+- `pass` validates that `--evidence=<path>` exists in the worktree (unless `--force` is passed) and wakes Gemini right away; Gemini's watcher, run in an Antigravity terminal, reads its conversation id from `ANTIGRAVITY_CONVERSATION_ID` and stores Antigravity's address and token in `%USERPROFILE%\.agents\bastao-antigravity.json` so Claude and Codex can wake it too (outside Antigravity, pass `--wake=<id>`). If the initial wake fails, any active watcher retries it in ~60 s. If Gemini shows no activity for `1/5` of `--parado-min` (3 min by default), it is re-woken once; if the baton holder remains idle until `--parado-min` (15 min), you are notified and `status` shows PARADO. `BASTAO_REWAKE=off` disables the re-wake.
 - Old cycles in `.agents/turn.json` keep working until `fim`.
 - Make each repository's vitest, eslint and tsconfig ignore `.worktrees/**`; otherwise tests and lint in the main folder read the worktrees. `init` warns when it is missing.
 

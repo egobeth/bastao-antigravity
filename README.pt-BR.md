@@ -42,7 +42,7 @@ O painel do Codex no Antigravity **não** se atualiza com turnos feitos fora del
   Get-Content .agents\live\<slug>\codex.log -Wait
   ```
 - Para ver esses turnos no próprio painel do Codex, rode **Developer: Reload Window** no Antigravity.
-- Se o Codex terminar sem passar o bastão (falha, binário ausente ou simplesmente parou), o ciclo vai para "aguardando humano" com popup, em vez de travar. Responda com:
+- Se o Codex terminar sem passar o bastão (falha, binário ausente ou simplesmente parou), ele faz **1 retry automático** via `resume` (quando há session id); só se ainda assim não passar o bastão o ciclo vai para "aguardando humano" com popup, em vez de travar. Enquanto roda, o `_codex` mantém um lock de heartbeat (`.agents/ciclos/<slug>.wait-codex.lock`), vigias ativos (`bastao wait`) o relançam caso o shell pai tenha sido encerrado antes da hora e a escrita em `codex.log` conta como atividade. Responda ao `WAITING_HUMAN` com:
   `bastao pass --from=human --to=codex --action=<ação> --force --notes="<sua resposta>"`
 
 ## Requisitos
@@ -100,7 +100,7 @@ bastao fim --ciclo=exportar-csv                 # depois do merge: remove o work
 ```
 
 - Dentro de `.worktrees/<slug>` o ciclo é deduzido. Na pasta principal, `pass`/`ask`/`wait`/`fim` exigem `--ciclo`.
-- O `pass` acorda o Gemini na hora; o vigia do Gemini, rodando num terminal do Antigravity, lê o ID da conversa de `ANTIGRAVITY_CONVERSATION_ID` e guarda o endereço e o token do Antigravity em `%USERPROFILE%\.agents\bastao-antigravity.json` para o Claude e o Codex também conseguirem acordá-lo (fora do Antigravity, passe `--wake=<id>`). Dono do bastão sem atividade por 15 min (`--parado-min`): o Gemini é reacordado uma vez e, persistindo, você é avisado e o `status` mostra PARADO. `BASTAO_REWAKE=off` desliga o reenvio.
+- O `pass` valida que `--evidence=<caminho>` existe no worktree (salvo com `--force`) e acorda o Gemini na hora; o vigia do Gemini, rodando num terminal do Antigravity, lê o ID da conversa de `ANTIGRAVITY_CONVERSATION_ID` e guarda o endereço e o token do Antigravity em `%USERPROFILE%\.agents\bastao-antigravity.json` para o Claude e o Codex também conseguirem acordá-lo (fora do Antigravity, passe `--wake=<id>`). Se o envio inicial falhar, qualquer vigia ativo retenta em ~60 s. Sem atividade do Gemini por `1/5` de `--parado-min` (3 min no padrão de 15 min), ele é reacordado uma vez; persistindo até `--parado-min` (15 min), você é avisado e o `status` mostra PARADO. `BASTAO_REWAKE=off` desliga o reenvio.
 - Ciclos antigos em `.agents/turn.json` seguem funcionando até o `fim`.
 - Faça vitest, eslint e tsconfig de cada repositório ignorarem `.worktrees/**`; senão testes e lint da pasta principal leem os worktrees. O `init` avisa quando falta.
 

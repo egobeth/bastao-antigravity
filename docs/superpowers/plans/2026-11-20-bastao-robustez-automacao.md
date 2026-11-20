@@ -29,7 +29,7 @@
   - `lastActivity({ dir, branch, state, liveDir = null }): number`
   - `decideStall(state, { now, activityMs, canRewake }): { action: 'none' | 'clear' | 'rewake' | 'notify', stall: object | null }`
 
-- [ ] **Step 1: Atualizar e escrever os testes em `parada.test.mjs` para Fast Rewake (1/5 do limite) e `codex.log`**
+- [x] **Step 1: Atualizar e escrever os testes em `parada.test.mjs` para Fast Rewake (1/5 do limite) e `codex.log`**
 
 Em `C:\Users\eduar\.agents\bastao\parada.test.mjs`, ajuste os testes de `decideStall` para o novo limiar (`rewake` aos 3 min quando `parado_min = 15`, `notify` aos 15 min) e adicione o teste de `liveDir/codex.log` em `lastActivity`:
 
@@ -75,12 +75,12 @@ test('lastActivity: mtime de codex.log em liveDir conta como atividade mesmo ign
 });
 ```
 
-- [ ] **Step 2: Rodar `node --test parada.test.mjs` e verificar que falha**
+- [x] **Step 2: Rodar `node --test parada.test.mjs` e verificar que falha**
 
 Run: `node --test C:\Users\eduar\.agents\bastao\parada.test.mjs`
 Expected: FAIL nos testes de `decideStall` (3 min vs 15 min) e `lastActivity` (`liveDir`).
 
-- [ ] **Step 3: Implementar `liveDir` em `lastActivity` e o Fast Rewake em `decideStall` (`parada.mjs`)**
+- [x] **Step 3: Implementar `liveDir` em `lastActivity` e o Fast Rewake em `decideStall` (`parada.mjs`)**
 
 Em `C:\Users\eduar\.agents\bastao\parada.mjs`:
 
@@ -143,7 +143,7 @@ export function decideStall(state, { now, activityMs, canRewake }) {
 }
 ```
 
-- [ ] **Step 4: Rodar `node --test parada.test.mjs` e confirmar que passa**
+- [x] **Step 4: Rodar `node --test parada.test.mjs` e confirmar que passa**
 
 Run: `node --test C:\Users\eduar\.agents\bastao\parada.test.mjs`
 Expected: PASS (100% dos testes em `parada.test.mjs`).
@@ -165,7 +165,7 @@ Expected: PASS (100% dos testes em `parada.test.mjs`).
   - 1 retry automático via `codex exec ... resume <sessionId> -` em `_codex` quando o Codex encerra sem passar o bastão.
   - Supervisão no `bastao wait` / `checarParada` para relançar `_codex` morto e retentar `wakeGemini` quando `wake.ok === false`.
 
-- [ ] **Step 1: Adicionar os novos testes em `test.mjs`**
+- [x] **Step 1: Adicionar os novos testes em `test.mjs`**
 
 Ao final de `C:\Users\eduar\.agents\bastao\test.mjs`, adicione os testes para os Itens 2, 3, 4 e 5:
 
@@ -286,7 +286,7 @@ test('wait: supervisiona e relança _codex se o processo do codex tiver morrido 
 });
 ```
 
-- [ ] **Step 2: Implementar as mudanças em `bastao.mjs`**
+- [x] **Step 2: Implementar as mudanças em `bastao.mjs`**
 
 1. Em `atividadeDe` (`bastao.mjs:496-497`), passe `liveDir: paths.liveDir`:
    ```js
@@ -346,13 +346,13 @@ test('wait: supervisiona e relança _codex se o processo do codex tiver morrido 
    - Encapsule a execução do processo do Codex em uma função auxiliar `execCodex(sessionId, promptText)` que grava no `logPath`, extrai `session id: <id>` do `fullOutput` (salvando em `conversations.codex` no arquivo de estado se novo) e retorna `{ exitCode, sessionId }`.
    - Se após a 1ª execução o estado ainda estiver com `current_turn === 'codex' && status === 'IN_PROGRESS'`, e houver `sessionId` (e `typeof exitCode === 'number'` e `process.env.BASTAO_CODEX_RETRY !== '0'`), grave `\n=== Retry automático · Round ${latest.round}/${latest.max_rounds} · ${latest.action} ===\n` no `logPath` e execute 1 retry com `execCodex(sessionId, retryPrompt)` antes de cair no `applyAsk` (`WAITING_HUMAN`).
 
-- [ ] **Step 3: Atualizar `SKILL.md` e sincronizar com `node bastao.mjs install --yes`**
+- [x] **Step 3: Atualizar `SKILL.md` e sincronizar com `node bastao.mjs install --yes`**
 
 Em `C:\Users\eduar\.agents\bastao\SKILL.md`:
 - Na seção `### Codex` (linha 42), documente que o `_codex` agora mantém lock de heartbeat (`.wait-codex.lock`), faz 1 retry automático via `resume` se encerrar sem passar o bastão e é relançado automaticamente pelo vigia (`bastao wait`) caso o Job Object do terminal do `pass` o encerre.
 - Na seção `### Acordar e parada` (linha 47), documente que o `rewake` automático do Gemini ocorre em `1/5` de `parado_min` (3 min no padrão de 15 min) e o alerta `PARADO` ocorre em `parado_min` (15 min), além de `codex.log` contar como atividade.
 
-- [ ] **Step 4: Rodar toda a suíte de testes e instalar a skill atualizada**
+- [x] **Step 4: Rodar toda a suíte de testes e instalar a skill atualizada**
 
 Run:
 ```powershell
@@ -361,7 +361,7 @@ node C:\Users\eduar\.agents\bastao\bastao.mjs install --yes
 ```
 Expected: 100% dos testes passando com 0 falhas e skill instalada nos 3 destinos (`.claude`, `.gemini`, `.codex`).
 
-- [ ] **Step 5: Fazer commit das alterações em `C:\Users\eduar\.agents\bastao`**
+- [x] **Step 5: Fazer commit das alterações em `C:\Users\eduar\.agents\bastao`**
 
 ```powershell
 git -C "$env:USERPROFILE\.agents\bastao" add parada.mjs parada.test.mjs bastao.mjs test.mjs SKILL.md

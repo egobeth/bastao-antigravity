@@ -494,7 +494,18 @@ export function findCodex() {
 }
 
 const atividadeDe = (state, paths, mainRepo) =>
-  lastActivity({ dir: paths.worktree || mainRepo, branch: state.branch, state });
+  lastActivity({ dir: paths.worktree || mainRepo, branch: state.branch, state, liveDir: paths.liveDir });
+
+function spawnCodexDetached(mainRepo, slug) {
+  const bastaoScript = fileURLToPath(import.meta.url);
+  const child = spawn(process.execPath, [bastaoScript, '_codex', `--repo=${mainRepo}`, `--ciclo=${slug}`], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: process.env
+  });
+  child.unref();
+}
 
 // Há quanto tempo o dono está com o bastão, vigias vivos, se dá para acordá-lo e se está PARADO.
 // Sem vigia vivo, a parada é calculada na hora (só para exibir).
@@ -698,11 +709,15 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
   const avisar = msg => notify(msg.replace(/^(\[[^\]]+\]) /, `$1 ${repoName}/`));
   const atividade = (state, cycle) => atividadeDe(state, cycle.paths, mainRepo);
 
-  // Rodado pelos vigias: reacorda o Gemini parado uma vez e, persistindo, avisa o usuário (uma vez por parada).
+  // Rodado pelos vigias: retenta wake inicial falho, reacorda o Gemini parado uma vez e, persistindo, avisa o usuário.
   const checarParada = async cycle => {
     const state = await readState(cycle.paths.state);
     if (!state) return;
     const canRewake = state.current_turn === 'gemini' && !!state.conversations?.gemini && process.env.BASTAO_REWAKE !== 'off';
+    if (state.status === 'IN_PROGRESS' && canRewake && !wakeHandled(state)) {
+      await wakeGemini(cycle.paths.state, state, { repoName, worktreeAbs: cycle.paths.worktree });
+      return;
+    }
     const activityMs = atividade(state, cycle);
     const { action, stall } = decideStall(state, { now: Date.now(), activityMs, canRewake });
     if (action === 'none') return;
@@ -840,6 +855,13 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       return;
     }
 
+    if (values.evidence && !values.force) {
+      const baseDir = cycle.paths.worktree || mainRepo;
+      if (!fs.existsSync(path.resolve(baseDir, values.evidence))) {
+        throw new BastaoError(`Arquivo de evidência não encontrado: ${values.evidence}`, 'EVIDENCE_NOT_FOUND');
+      }
+    }
+
     const { state: nextState, notify: notifyMsg } = applyPass(state, {
       from: values.from,
       to: values.to,
@@ -874,14 +896,7 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
     }
 
     if (nextState.current_turn === 'codex' && nextState.status === 'IN_PROGRESS') {
-      const bastaoScript = fileURLToPath(import.meta.url);
-      const child = spawn(process.execPath, [bastaoScript, '_codex', `--repo=${mainRepo}`, `--ciclo=${cycle.slug}`], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-        env: process.env
-      });
-      child.unref();
+      spawnCodexDetached(mainRepo, cycle.slug);
     }
     return;
   }
@@ -1037,6 +1052,7 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       const startTime = Date.now();
       const stallEvery = Number(process.env.BASTAO_STALL_CHECK_MS) || 60000;
       let nextStallCheck = Date.now() + stallEvery;
+      let lastCodexSpawn = 0;
 
       while (true) {
         try {
@@ -1049,6 +1065,15 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
         }
 
         const state = await readState(file);
+
+        if (state && state.current_turn === 'codex' && state.status === 'IN_PROGRESS' && !isLockAlive(cycle.paths.lock('codex'))) {
+          const lastPassMs = Date.parse((state.history || []).filter(h => h.from !== 'bastao').at(-1)?.at) || 0;
+          const graceMs = Number(process.env.BASTAO_CODEX_GRACE_MS) || 2000;
+          if (Date.now() - lastPassMs >= graceMs && Date.now() - lastCodexSpawn >= Math.max(graceMs, 2000)) {
+            lastCodexSpawn = Date.now();
+            spawnCodexDetached(mainRepo, cycle.slug);
+          }
+        }
 
         if (state && ['APPROVED', 'MAX_ROUNDS_REACHED', 'MANUAL_PAUSE'].includes(state.status)) {
           if (wakeId) {
@@ -1132,87 +1157,121 @@ principal, pass/ask/wait/fim exigem --ciclo. Ciclo já existe? Use 'status' e 'p
       return;
     }
 
-    let codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', workDir];
-    // No worktree, o .git (objetos e refs) fica na pasta principal: o sandbox precisa liberá-lo para o commit.
-    if (cycle.paths.worktree) codexArgs.push('--add-dir', gitCommonDir(mainRepo));
-    // O estado do ciclo também fica na pasta principal: sem isso o `bastao pass` do Codex falha com EPERM.
-    if (cycle.paths.worktree) codexArgs.push('--add-dir', path.dirname(file));
-    if (state.conversations?.codex) {
-      codexArgs.push('resume', state.conversations.codex);
-    }
-    codexArgs.push('-');
+    const lockPath = cycle.paths.lock('codex');
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    if (isLockAlive(lockPath)) return;
 
-    const prompt = `${instr(state, cycle)}\n\nVocê é o Codex no Protocolo do Bastão. Siga a skill bastao. Termine SEMPRE com: bastao pass --from=codex …`;
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }), 'utf8');
+    const pollMs = Number(process.env.BASTAO_POLL_MS) || 2000;
+    const heartbeat = setInterval(() => {
+      try { fs.utimesSync(lockPath, new Date(), new Date()); } catch {}
+    }, pollMs);
+    heartbeat.unref?.();
 
-    const liveDir = cycle.paths.liveDir;
-    fs.mkdirSync(liveDir, { recursive: true });
-    const logPath = path.join(liveDir, 'codex.log');
+    const cleanLock = () => {
+      clearInterval(heartbeat);
+      try {
+        if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+      } catch {}
+    };
+    process.on('exit', cleanLock);
 
-    const nowTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-    const separator = `\n=== Round ${state.round}/${state.max_rounds} · ${state.action} · ${nowTime} ===\n`;
-    fs.appendFileSync(logPath, separator, 'utf8');
-
-    // Qualquer falha (Codex ausente, spawn recusado) cai no applyAsk abaixo em vez de deixar o ciclo preso em codex.
-    let fullOutput = '';
-    let exitCode;
     try {
-      const codexBin = findCodex();
-      const isNodeScript = /\.m?js$/i.test(codexBin);
-      const execCmd = isNodeScript ? process.execPath : codexBin;
-      const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
+      const liveDir = cycle.paths.liveDir;
+      fs.mkdirSync(liveDir, { recursive: true });
+      const logPath = path.join(liveDir, 'codex.log');
 
-      const child = spawn(execCmd, finalArgs, {
-        cwd: workDir,
-        windowsHide: true,
-        env: process.env
-      });
+      const execCodex = async (sessionId, promptText) => {
+        const codexArgs = ['exec', '--sandbox', 'workspace-write', '-C', workDir];
+        // No worktree, o .git (objetos e refs) fica na pasta principal: o sandbox precisa liberá-lo para o commit.
+        if (cycle.paths.worktree) codexArgs.push('--add-dir', gitCommonDir(mainRepo));
+        // O estado do ciclo também fica na pasta principal: sem isso o `bastao pass` do Codex falha com EPERM.
+        if (cycle.paths.worktree) codexArgs.push('--add-dir', path.dirname(file));
+        if (sessionId) codexArgs.push('resume', sessionId);
+        codexArgs.push('-');
 
-      child.stdin.on('error', () => {});
-      child.stdin.write(prompt, 'utf8');
-      child.stdin.end();
+        // Qualquer falha (Codex ausente, spawn recusado) cai no applyAsk abaixo em vez de deixar o ciclo preso em codex.
+        let fullOutput = '';
+        let exitCode;
+        try {
+          const codexBin = findCodex();
+          const isNodeScript = /\.m?js$/i.test(codexBin);
+          const execCmd = isNodeScript ? process.execPath : codexBin;
+          const finalArgs = isNodeScript ? [codexBin, ...codexArgs] : codexArgs;
 
-      child.stdout.on('data', chunk => {
-        fullOutput += chunk.toString('utf8');
-        fs.appendFileSync(logPath, chunk);
-      });
-      child.stderr.on('data', chunk => {
-        fullOutput += chunk.toString('utf8');
-        fs.appendFileSync(logPath, chunk);
-      });
+          const child = spawn(execCmd, finalArgs, {
+            cwd: workDir,
+            windowsHide: true,
+            env: process.env
+          });
 
-      exitCode = await new Promise(resolve => {
-        child.on('error', err => resolve(err.message));
-        child.on('close', resolve);
-      });
-    } catch (err) {
-      exitCode = err.message;
-    }
-    if (typeof exitCode === 'string') fs.appendFileSync(logPath, `bastao: ${exitCode}\n`, 'utf8');
+          child.stdin.on('error', () => {});
+          child.stdin.write(promptText, 'utf8');
+          child.stdin.end();
 
-    if (!state.conversations?.codex) {
-      const m = fullOutput.match(/session id:\s*([a-zA-Z0-9_-]+)/i);
-      if (m) {
-        const sessId = m[1];
-        const cur = await readState(file);
-        if (cur) {
-          cur.conversations = cur.conversations || {};
-          cur.conversations.codex = sessId;
-          writeState(file, cur);
+          child.stdout.on('data', chunk => {
+            fullOutput += chunk.toString('utf8');
+            fs.appendFileSync(logPath, chunk);
+          });
+          child.stderr.on('data', chunk => {
+            fullOutput += chunk.toString('utf8');
+            fs.appendFileSync(logPath, chunk);
+          });
+
+          exitCode = await new Promise(resolve => {
+            child.on('error', err => resolve(err.message));
+            child.on('close', resolve);
+          });
+        } catch (err) {
+          exitCode = err.message;
         }
-      }
-    }
+        if (typeof exitCode === 'string') fs.appendFileSync(logPath, `bastao: ${exitCode}\n`, 'utf8');
 
-    const latest = await readState(file);
-    if (latest && latest.current_turn === 'codex' && latest.status === 'IN_PROGRESS') {
-      const question = `Codex terminou sem passar o bastão (exit ${exitCode ?? 0}). Veja ${path.relative(mainRepo, logPath)}`;
-      const { state: nextState, notify: notifyMsg } = applyAsk(latest, {
-        from: 'codex',
-        question
-      });
-      writeState(file, nextState);
-      if (notifyMsg) avisar(notifyMsg);
+        let capturedSession = sessionId || null;
+        if (!capturedSession) {
+          const m = fullOutput.match(/session id:\s*([a-zA-Z0-9_-]+)/i);
+          if (m) {
+            capturedSession = m[1];
+            const cur = await readState(file);
+            if (cur) {
+              cur.conversations = cur.conversations || {};
+              cur.conversations.codex = capturedSession;
+              writeState(file, cur);
+            }
+          }
+        }
+        return { exitCode, sessionId: capturedSession };
+      };
+
+      const nowTime = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+      const separator = `\n=== Round ${state.round}/${state.max_rounds} · ${state.action} · ${nowTime} ===\n`;
+      fs.appendFileSync(logPath, separator, 'utf8');
+
+      const prompt = `${instr(state, cycle)}\n\nVocê é o Codex no Protocolo do Bastão. Siga a skill bastao. Termine SEMPRE com: bastao pass --from=codex …`;
+      let { exitCode, sessionId } = await execCodex(state.conversations?.codex || null, prompt);
+      let latest = await readState(file);
+
+      if (latest && latest.current_turn === 'codex' && latest.status === 'IN_PROGRESS'
+        && typeof exitCode === 'number' && sessionId && process.env.BASTAO_CODEX_RETRY !== '0') {
+        fs.appendFileSync(logPath, `\n=== Retry automático · Round ${latest.round}/${latest.max_rounds} · ${latest.action} ===\n`, 'utf8');
+        const retryPrompt = `${instr(latest, cycle)}\n\nVocê é o Codex no Protocolo do Bastão. Seu turno anterior encerrou sem passar o bastão. Conclua o que faltar e termine SEMPRE com: bastao pass --from=codex …`;
+        ({ exitCode } = await execCodex(sessionId, retryPrompt));
+        latest = await readState(file);
+      }
+
+      if (latest && latest.current_turn === 'codex' && latest.status === 'IN_PROGRESS') {
+        const question = `Codex terminou sem passar o bastão (exit ${exitCode ?? 0}). Veja ${path.relative(mainRepo, logPath)}`;
+        const { state: nextState, notify: notifyMsg } = applyAsk(latest, {
+          from: 'codex',
+          question
+        });
+        writeState(file, nextState);
+        if (notifyMsg) avisar(notifyMsg);
+      }
+      return;
+    } finally {
+      cleanLock();
     }
-    return;
   }
 
   throw new BastaoError(`Comando desconhecido: ${command}`, 'UNKNOWN_COMMAND');

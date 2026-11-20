@@ -10,23 +10,24 @@ const T0 = Date.parse('2026-10-27T12:00:00Z');
 const iso = ms => new Date(ms).toISOString();
 const base = (extra = {}) => ({ status: 'IN_PROGRESS', current_turn: 'gemini', parado_min: 15, stall: null, ...extra });
 
-test('decideStall: dentro do limite não faz nada', () => {
-  assert.deepEqual(decideStall(base(), { now: T0 + 14 * MIN, activityMs: T0, canRewake: true }), { action: 'none', stall: null });
+test('decideStall: dentro do limite de rewake não faz nada', () => {
+  assert.deepEqual(decideStall(base(), { now: T0 + 2 * MIN, activityMs: T0, canRewake: true }), { action: 'none', stall: null });
+  assert.deepEqual(decideStall(base(), { now: T0 + 14 * MIN, activityMs: T0, canRewake: false }), { action: 'none', stall: null });
 });
 
-test('decideStall: gemini acordável parado é reacordado uma vez', () => {
-  const r = decideStall(base(), { now: T0 + 15 * MIN, activityMs: T0, canRewake: true });
+test('decideStall: gemini acordável parado é reacordado uma vez em 1/5 do limite (3 min)', () => {
+  const r = decideStall(base(), { now: T0 + 3 * MIN, activityMs: T0, canRewake: true });
   assert.equal(r.action, 'rewake');
-  assert.deepEqual(r.stall, { since: iso(T0), rewake_at: iso(T0 + 15 * MIN), notified_at: null });
-  const again = decideStall(base({ stall: r.stall }), { now: T0 + 20 * MIN, activityMs: T0, canRewake: true });
+  assert.deepEqual(r.stall, { since: iso(T0), rewake_at: iso(T0 + 3 * MIN), notified_at: null });
+  const again = decideStall(base({ stall: r.stall }), { now: T0 + 10 * MIN, activityMs: T0, canRewake: true });
   assert.equal(again.action, 'none');
 });
 
-test('decideStall: depois do reenvio, avisa no dobro do tempo e só uma vez', () => {
-  const stall = { since: iso(T0), rewake_at: iso(T0 + 15 * MIN), notified_at: null };
-  const r = decideStall(base({ stall }), { now: T0 + 30 * MIN, activityMs: T0, canRewake: true });
+test('decideStall: depois do reenvio, avisa no limite (15 min) e só uma vez', () => {
+  const stall = { since: iso(T0), rewake_at: iso(T0 + 3 * MIN), notified_at: null };
+  const r = decideStall(base({ stall }), { now: T0 + 15 * MIN, activityMs: T0, canRewake: true });
   assert.equal(r.action, 'notify');
-  assert.equal(r.stall.notified_at, iso(T0 + 30 * MIN));
+  assert.equal(r.stall.notified_at, iso(T0 + 15 * MIN));
   assert.equal(r.stall.rewake_at, stall.rewake_at);
   assert.equal(decideStall(base({ stall: r.stall }), { now: T0 + 90 * MIN, activityMs: T0, canRewake: true }).action, 'none');
 });
@@ -97,4 +98,19 @@ test("isParado ignora ciclo terminal ou com human", () => {
   const stall = { since: iso(T0), rewake_at: null, notified_at: iso(T0) };
   assert.equal(isParado(base({ stall, status: "APPROVED", current_turn: "human" })), false);
   assert.equal(isParado(base({ stall, current_turn: "human" })), false);
+});
+
+test('lastActivity: mtime de codex.log em liveDir conta como atividade mesmo ignorado pelo git', () => {
+  const repo = tempRepo();
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '\n.agents/live/\n');
+  const branch = git(repo, 'branch', '--show-current').stdout.trim();
+  const commitTs = Number(git(repo, 'log', '-1', '--format=%ct').stdout.trim()) * 1000;
+  const state = { history: [{ at: iso(commitTs), from: 'claude' }] };
+  const liveDir = path.join(repo, '.agents', 'live', 'c1');
+  fs.mkdirSync(liveDir, { recursive: true });
+  const logFile = path.join(liveDir, 'codex.log');
+  fs.writeFileSync(logFile, 'rodando...');
+  const novo = new Date(commitTs + 120_000);
+  fs.utimesSync(logFile, novo, novo);
+  assert.equal(lastActivity({ dir: repo, branch, state, liveDir }), novo.getTime());
 });

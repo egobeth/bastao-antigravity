@@ -6,10 +6,16 @@ const git = (dir, args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' }
 
 // Última atividade do dono do bastão, em ms: arquivos alterados no worktree, último commit da branch e
 // último evento do histórico que não seja do próprio bastão (acordar não é atividade de ninguém).
-export function lastActivity({ dir, branch, state }) {
+export function lastActivity({ dir, branch, state, liveDir = null }) {
   const events = (state.history || []).filter(h => h.from !== 'bastao');
   if (events.length === 0) return Date.now();
   let last = Date.parse(events.at(-1).at) || 0;
+
+  if (liveDir) {
+    try {
+      last = Math.max(last, fs.statSync(path.join(liveDir, 'codex.log')).mtimeMs);
+    } catch {}
+  }
 
   const log = git(dir, ['log', '-1', '--format=%ct', branch]);
   if (log.status === 0) last = Math.max(last, Number(log.stdout.trim()) * 1000 || 0);
@@ -35,17 +41,24 @@ export function decideStall(state, { now, activityMs, canRewake }) {
   if (stall && activityMs > Date.parse(stall.since)) return { action: 'clear', stall: null };
 
   const limit = state.parado_min * 60000;
+  const rewakeLimit = limit / 5;
   const idle = now - activityMs;
   const iso = ms => new Date(ms).toISOString();
-  if (idle < limit) return { action: 'none', stall };
 
-  if (!stall) {
-    return canRewake
-      ? { action: 'rewake', stall: { since: iso(activityMs), rewake_at: iso(now), notified_at: null } }
-      : { action: 'notify', stall: { since: iso(activityMs), rewake_at: null, notified_at: iso(now) } };
+  if (canRewake) {
+    if (idle < rewakeLimit) return { action: 'none', stall };
+    if (!stall) {
+      return { action: 'rewake', stall: { since: iso(activityMs), rewake_at: iso(now), notified_at: null } };
+    }
+    if (idle >= limit && stall.rewake_at && !stall.notified_at) {
+      return { action: 'notify', stall: { ...stall, notified_at: iso(now) } };
+    }
+    return { action: 'none', stall };
   }
-  if (idle >= 2 * limit && stall.rewake_at && !stall.notified_at) {
-    return { action: 'notify', stall: { ...stall, notified_at: iso(now) } };
+
+  if (idle < limit) return { action: 'none', stall };
+  if (!stall) {
+    return { action: 'notify', stall: { since: iso(activityMs), rewake_at: null, notified_at: iso(now) } };
   }
   return { action: 'none', stall };
 }

@@ -1444,3 +1444,184 @@ test('codexDoWhere: shim do npm no Windows vira o codex.js; .exe direto é manti
     fs.rmSync(npm, { recursive: true, force: true });
   }
 });
+
+// --- Robustez e automação (Itens 2 a 5) ---
+
+test('pass: recusa --evidence que não existe no worktree (salvo --force) e aceita quando existe', () => {
+  const repo = tempRepo();
+  runCli(['init', '--task=ev', '--slug=ev', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=ev'], repo);
+
+  const falho = runCli([
+    'pass', '--from=gemini', '--to=claude', '--action=review',
+    '--evidence=docs/evidence/nao-existe.md', `--repo=${repo}`, '--ciclo=ev'
+  ], repo);
+  assert.equal(falho.status, 1);
+  assert.match(falho.stderr, /Arquivo de evidência não encontrado/i);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'ev.json'), 'utf8')).current_turn, 'gemini');
+
+  const wt = path.join(repo, '.worktrees', 'ev');
+  fs.mkdirSync(path.join(wt, 'docs', 'evidence'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'docs', 'evidence', 'ok.md'), '# Evidencia');
+
+  const ok = runCli([
+    'pass', '--from=gemini', '--to=claude', '--action=review',
+    '--evidence=docs/evidence/ok.md', `--repo=${repo}`, '--ciclo=ev'
+  ], repo);
+  assert.equal(ok.status, 0, `stderr: ${ok.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'ev.json'), 'utf8')).current_turn, 'claude');
+
+  const forca = runCli([
+    'pass', '--from=claude', '--to=gemini', '--action=fix',
+    '--evidence=docs/evidence/forcado-inexistente.md', '--force', `--repo=${repo}`, '--ciclo=ev'
+  ], repo);
+  assert.equal(forca.status, 0, `stderr: ${forca.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'ev.json'), 'utf8')).current_turn, 'gemini');
+});
+
+test('codex: _codex mantém lock vivo durante execução, recusa 2ª instância simultânea e limpa lock ao sair', async () => {
+  const repo = tempRepo();
+  const tmpDir = fs.mkdtempSync(path.join(ROOT, 'fake-codex-lock-'));
+  const scriptPath = path.join(tmpDir, 'fake-codex-lock.mjs');
+  const runsFile = path.join(tmpDir, 'runs.txt');
+  const startedFile = path.join(tmpDir, 'started.txt');
+  const releaseFile = path.join(tmpDir, 'release.txt');
+  const codexLock = path.join(repo, '.agents', 'ciclos', 'clock.wait-codex.lock');
+  fs.writeFileSync(scriptPath, `import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+process.stdin.resume();
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(runsFile)}, 'run\\n');
+  const hasLock = fs.existsSync(${JSON.stringify(codexLock)});
+  fs.writeFileSync(${JSON.stringify(startedFile)}, hasLock ? 'LOCK_OK' : 'NO_LOCK');
+  const start = Date.now();
+  while (!fs.existsSync(${JSON.stringify(releaseFile)}) && Date.now() - start < 5000) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+  }
+  const cIndex = process.argv.indexOf('-C');
+  const workDir = cIndex !== -1 ? process.argv[cIndex + 1] : process.cwd();
+  spawnSync(process.execPath, [
+    ${JSON.stringify(BASTAO_CLI)}, 'pass', '--repo=' + workDir, '--from=codex', '--to=claude', '--action=review'
+  ], { stdio: 'inherit' });
+  process.exit(0);
+});
+`, 'utf8');
+
+  runCli(['init', '--task=l', '--slug=clock', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const file = path.join(repo, '.agents', 'ciclos', 'clock.json');
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  st.current_turn = 'codex';
+  st.action = 'implement';
+  st.seq = 1;
+  fs.writeFileSync(file, JSON.stringify(st));
+
+  const proc1 = spawn(process.execPath, [BASTAO_CLI, '_codex', `--repo=${repo}`, '--ciclo=clock'], {
+    cwd: repo,
+    env: { ...process.env, BASTAO_CODEX: scriptPath, BASTAO_POLL_MS: '50', BASTAO_NOTIFY: 'off' }
+  });
+
+  const start = Date.now();
+  while (!fs.existsSync(startedFile) && Date.now() - start < 10000) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  assert.equal(fs.readFileSync(startedFile, 'utf8'), 'LOCK_OK', 'lock deve existir durante execução do _codex');
+
+  // Segunda instância simultânea deve sair imediatamente sem executar o Codex novamente
+  const dup = runCli(['_codex', `--repo=${repo}`, '--ciclo=clock'], repo, { BASTAO_CODEX: scriptPath, BASTAO_POLL_MS: '50' });
+  assert.equal(dup.status, 0);
+
+  fs.writeFileSync(releaseFile, 'go');
+  const code1 = await new Promise(resolve => proc1.on('close', resolve));
+  assert.equal(code1, 0);
+  assert.equal(fs.readFileSync(runsFile, 'utf8').trim().split('\n').length, 1, 'apenas uma instância do Codex deve rodar');
+  assert.ok(!fs.existsSync(codexLock), 'lock deve ser removido ao sair');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).current_turn, 'claude');
+});
+
+test('vigia de outro agente retenta wakeGemini quando o wake inicial do pass falhou', async () => {
+  const { repo, file } = cicloComGemini('retwake', 'conv-rw');
+  const { scriptPath, logPath } = setupFakeAgentApi();
+  runCli(['pass', '--from=claude', '--to=gemini', '--action=implement', `--repo=${repo}`, '--ciclo=retwake'], repo,
+    { BASTAO_AGENTAPI: scriptPath, FAKE_EXIT: '1' });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).wake.ok, false);
+
+  const vigia = spawn(process.execPath, [
+    BASTAO_CLI, 'wait', '--for=claude', '--timeout-min=0.02', `--repo=${repo}`, '--ciclo=retwake'
+  ], {
+    cwd: repo,
+    env: { ...process.env, BASTAO_AGENTAPI: scriptPath, FAKE_LOG: logPath, BASTAO_POLL_MS: '50', BASTAO_STALL_CHECK_MS: '80', BASTAO_NOTIFY: 'off' }
+  });
+  await new Promise(resolve => vigia.on('close', resolve));
+
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(st.wake.ok, true, 'checarParada deve ter reenviado o wake falho');
+  assert.ok(fs.existsSync(logPath));
+});
+
+test('codex: faz 1 retry automático via resume quando a 1ª tentativa sai sem passar o bastão e recupera na 2ª', async () => {
+  const repo = tempRepo();
+  const tmpDir = fs.mkdtempSync(path.join(ROOT, 'fake-codex-retry-'));
+  const scriptPath = path.join(tmpDir, 'fake-codex-retry.mjs');
+  const countFile = path.join(tmpDir, 'count.txt');
+  fs.writeFileSync(scriptPath, `import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+let stdin = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', c => stdin += c);
+process.stdin.on('end', () => {
+  const n = fs.existsSync(${JSON.stringify(countFile)}) ? Number(fs.readFileSync(${JSON.stringify(countFile)}, 'utf8')) + 1 : 1;
+  fs.writeFileSync(${JSON.stringify(countFile)}, String(n), 'utf8');
+  process.stdout.write('session id: sess-retry-1\\n');
+  if (n >= 2 && process.argv.includes('resume')) {
+    const cIndex = process.argv.indexOf('-C');
+    const workDir = cIndex !== -1 ? process.argv[cIndex + 1] : process.cwd();
+    spawnSync(process.execPath, [
+      ${JSON.stringify(BASTAO_CLI)}, 'pass', '--repo=' + workDir, '--from=codex', '--to=claude', '--action=review'
+    ], { stdio: 'inherit' });
+  }
+  process.exit(0);
+});
+`, 'utf8');
+
+  runCli(['init', '--task=r', '--slug=cretry', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  runCli(['pass', '--from=claude', '--to=codex', '--action=implement', `--repo=${repo}`, '--ciclo=cretry'], repo,
+    { BASTAO_CODEX: scriptPath });
+
+  const start = Date.now();
+  let state = null;
+  while (Date.now() - start < 15000) {
+    await new Promise(r => setTimeout(r, 100));
+    state = JSON.parse(fs.readFileSync(path.join(repo, '.agents', 'ciclos', 'cretry.json'), 'utf8'));
+    if (state.current_turn === 'claude') break;
+  }
+  assert.equal(state.current_turn, 'claude', 'Retry automático deve ter concluído o pass para claude');
+  assert.equal(state.status, 'IN_PROGRESS');
+  assert.equal(fs.readFileSync(countFile, 'utf8'), '2');
+  const liveLog = fs.readFileSync(path.join(repo, '.agents', 'live', 'cretry', 'codex.log'), 'utf8');
+  assert.match(liveLog, /Retry automático/);
+});
+
+test('wait: supervisiona e relança _codex se o processo do codex tiver morrido sem lock ativo', async () => {
+  const repo = tempRepo();
+  const { scriptPath, logPath } = setupFakeCodex();
+  runCli(['init', '--task=sup', '--slug=csup', '--spec=s', '--plan=p', `--repo=${repo}`], repo);
+  const file = path.join(repo, '.agents', 'ciclos', 'csup.json');
+  // Simula estado em que o bastão foi passado para codex mas o processo _codex morreu junto com o shell do pass
+  const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+  st.current_turn = 'codex';
+  st.action = 'implement';
+  st.seq = 1;
+  st.history.push({ at: new Date(Date.now() - 5000).toISOString(), from: 'claude', to: 'codex', action: 'implement', round: 1, notes: '' });
+  fs.writeFileSync(file, JSON.stringify(st));
+
+  const res = runCli(['wait', '--for=claude', '--timeout-min=0.2', `--repo=${repo}`, '--ciclo=csup'], repo, {
+    BASTAO_CODEX: scriptPath,
+    BASTAO_CLI_PATH: BASTAO_CLI,
+    FAKE_LOG: logPath,
+    FAKE_PASS: '1',
+    BASTAO_POLL_MS: '50',
+    BASTAO_CODEX_GRACE_MS: '100'
+  });
+  assert.equal(res.status, 0, `wait deve acordar claude após relançar _codex; stderr: ${res.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).current_turn, 'claude');
+});
